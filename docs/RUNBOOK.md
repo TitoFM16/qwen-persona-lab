@@ -65,6 +65,16 @@ Open **http://127.0.0.1:8787** for the persona lab and **http://127.0.0.1:8791**
 
 There are no local copies of the roughly 76 GB GPU model cache. A fresh rental downloads the requested models again. Allow at least 15 minutes for the small-model setup and plan **30–60 minutes of lead time when prefetching all three**, depending on image pulls, offer networking, Hugging Face throughput and package downloads. The script's default is only 4B, but the command above explicitly requests all three. Follow `outputs/presentation-setup.log` from another Terminal while setup runs.
 
+### Optional Mac-side Claude bridge
+
+For the **Ask Claude** button, run on the Mac (on the Mac):
+
+```bash
+python3 -u scripts/recipe_assistant.py   # 127.0.0.1:8788
+```
+
+It uses your local Claude OAuth (`claude auth login` if needed), canonical `claude-haiku-5-5`, tool-free safe mode, strict MCP and no execution. Anthropic hosts the model; only the selected recipe (including any custom edits) plus question/history leaves the Mac; no credentials are sent to the GPU; authentication stays with the local Claude CLI. The browser reaches it directly on loopback 8788 (strict CORS for 8791); the Mac must stay awake and online. Original `/api/agent*` still returns 403. Deployment verified as root: real question about the Cookie Monster recipe 200 (Haiku 5.5, tools_enabled false), CORS 8791 204/foreign 403, legacy agent routes 403, injected tail and assets match hash, all three GPU models still resident, 190 local CPU tests passing. The rental (60502794, US$1.45222/h, about US$10.86 estimate) and the independent GPU timer (4 p.m. Bogotá, 21:00 UTC, 2026-11-13) are unchanged.
+
 ## Adopt a running rental (`--resume-existing`) and controller handoff
 
 Use this only when a controller process is already running a rental whose setup is stuck behind the old fixed one-hour SSH limit (new controllers no longer have it; setup waits are bounded by the absolute deadline). Adoption never rents, never extends the deadline, never bootstraps and never re-arms the remote timer.
@@ -90,6 +100,24 @@ Resident pool: live services run with `QWEN_RESIDENT_MODELS=1`. On startup a tru
 Current deployment (rental 60502794, observed 2026-11-13): all three models are resident and GPU-ready in retained runtimes rt-1/rt-2/rt-3 (load_count 1 each, BF16, pinned revisions) beside the separate 4B explorer runtime. NVIDIA: 86,831 of 97,887 MiB used, 10,419 MiB available free (thin; do not compute free as total minus used). A four-request switch test showed unchanged runtime IDs and load counts. Evidence: `outputs/today-resident-pool-validation.{md,json}`.
 
 Models: readiness uses the pinned revisions in `data/model-cache-manifest.json`; Qwen3.5-4B is ready only when config, tokenizer files and every unique shard in `model.safetensors.index.json` exist as complete non-empty files (broken links and `.incomplete` blobs are not ready). As soon as 4B is ready the controller runs `scripts/start_services.sh` and opens tunnels; 8B/27B continue in the background (default `--models` is all three when adopting). It launches one trusted `nohup` pinned downloader only if no `snapshot_download` process is already running; it never signals existing remote processes. Caveat: if the old SSH session's death hangs up a downloader that is not `nohup`/detached, that is outside this controller; check the remote `pgrep -af snapshot_download` after the SIGKILL.
+
+## Import the five custom 27B personas
+
+Offline, no network or GPU. The export `data/custom/qwen3.8-27b-personas.json` is an object whose `recipes` list holds the records; each `recipe.raw` and `recipe.source_key` is preserved so the IDs stay `custom:<source_key>`. The current database already contains the five; use this on a replica (re-running an unchanged record is a no-op upsert). `Catalog.upsert(raw, source, source_key=None, default_model=None)` and `Catalog.close()` exist in `lab/catalog.py`.
+
+```python
+from lab.catalog import Catalog
+import json
+from pathlib import Path
+
+cat = Catalog('data/lab.sqlite3')
+for item in json.loads(Path('data/custom/qwen3.8-27b-personas.json').read_text())['recipes']:
+    r = item['recipe']
+    cat.upsert(r['raw'], 'custom', source_key=r['source_key'])
+cat.close()
+```
+
+Imported records start as `pending`; the parent link is kept in `raw.parent_recipe_id`.
 
 ## End the presentation and remove the rental
 

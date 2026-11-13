@@ -4,9 +4,42 @@ A local neuron-steering lab with a searchable personality catalog, editable dose
 
 Private source repository: [TitoFM16/qwen-persona-lab](https://github.com/TitoFM16/qwen-persona-lab). Credentials, model weights, runtime databases and generated outputs are excluded from Git.
 
-The UI now supports live baseline-versus-steered conversations and **My personas**: start from a recipe, edit/add/remove its model-specific neuron components and signed doses, then save a named personal variant without overwriting the source. Saving persists a pending recipe; it neither trains weights nor starts validation. The frontend editor was implemented with local **Claude Sonnet 5.5** and checked alongside the Python API. See [today’s live walkthrough](docs/LIVE_DEMO.md) for the November 13 presentation and 4:00 p.m. Bogotá cutoff. **Local software suite on November 13, 2026: 130 tests passed** (local CPU/software tests, not GPU or scientific validation); earlier 69-test reports are historical and describe the previous implementation.
+The UI now supports live baseline-versus-steered conversations and **My personas**: start from a recipe, edit/add/remove its model-specific neuron components and signed doses, then save a named personal variant without overwriting the source. Saving persists a pending recipe; it neither trains weights nor starts validation. The frontend editor was implemented with local **Claude Sonnet 5.5** and checked alongside the Python API. See [today’s live walkthrough](docs/LIVE_DEMO.md) for the November 13 presentation and 4:00 p.m. Bogotá cutoff. **Local software suite on November 13, 2026: 190 tests passed** (130 prior + 37 bridge + 23 feature; local CPU/software tests, not GPU or scientific validation); earlier 69-test reports are historical and describe the previous implementation.
 
 **Current live presentation (November 13):** the rental is ready and the UI and 3D explorer are reachable on the Mac through local-only forwards, and **all three models (Qwen3.5-4B, Qwen3-8B, Qwen3.8-27B) are GPU-resident and GPU-ready** on the current rental (instance 60502794; API ready/resident lists contain all three, `model_errors={}`). The UI is chat-first: selecting a persona opens the conversation but does not generate; type in the composer and press Send or Enter (Shift+Enter for a newline). Each steered reply has a collapsed same-model, unsteered baseline disclosure. Optional comparison and advanced neuron editing/save controls are in collapsed sections. The **resident model pool** is deployed on the existing rental (`QWEN_RESIDENT_MODELS=1`). All three models are held in separate retained runtimes (`rt-1`/`rt-2`/`rt-3`, load_count 1 each, BF16 at pinned revisions, no NVFP4/quantization substitution), alongside the original separate 4B 3D-explorer runtime on the same 96 GB RTX PRO 6000. Switching between them reuses retained weights and kernel warm-up (no unload/reload per selection), and same-model persona switches change only temporary steering hooks. Observed snapshot (2026-11-13, not a guarantee for other contexts): NVIDIA reported 97,887 MiB total, 86,831 MiB used (~84.8 GiB) and 10,419 MiB (~10.2 GiB) available free; the API's torch allocation was 80,191,505,408 bytes (a per-process figure, not whole-device usage) with 10,925,047,808 bytes torch-free. Headroom is thin. A root-run four-switch validation (15:22 UTC) passed: see [verification](docs/verification.md). Generation and loading share one GPU lock, so concurrent requests queue (not parallel multi-model generation; suited to one presenter). A startup thread warms each fully cached model with a tiny unsteered generation (never starting a download); this does not guarantee zero latency for every prompt. The UI distinguishes download/cache waiting, GPU warming and GPU ready. BF16 is unchanged with no quantized substitution. The original 3D explorer has its own 4B runtime. The per-model smoke table below is historical evidence from an earlier, destroyed rental (individual 32-token peaks); the simultaneous-pool memory figures above are a separate, current measurement. An independent GPU-side deletion timer is armed alongside the local deadline; keep the Mac awake and online for the tunnel and result backup.
+
+## Recipe buttons and Claude assistant (deployed November 13)
+
+In the main lab (http://127.0.0.1:8787) a selected recipe has two buttons:
+
+- **Open original 3D (4B)** passes the exact current, edited components (signed doses plus method, normalization and provenance) in the URL fragment. The explorer focuses the first component, highlights all of them and shows the signed list. The original upstream chat steers only the one focused neuron; full-combination generation stays in the Lab. The original 3D coordinates exist only for Qwen3.5-4B.
+- **Ask Claude** works for any supported model. For a non-4B recipe it opens the original Claude tab with the recipe metadata, but the 4B map is hidden (a model boundary: no cross-model coordinates).
+
+Claude answers come from a Mac-side bridge, not from the GPU:
+
+```bash
+python3 -u scripts/recipe_assistant.py   # serves 127.0.0.1:8788
+```
+
+It uses your local Claude OAuth login (`claude auth login` if needed) with canonical `claude-haiku-5-5` in tool-free, safe mode, strict MCP and no execution. The model runs remotely at Anthropic through the Mac CLI, not as local weights. Only the selected recipe (including any custom edits) plus question/history is sent to Anthropic; no credentials are sent to the GPU; authentication stays with the local Claude CLI. The browser talks directly to loopback 8788 (strict CORS for 8791), so the Mac must stay awake and online. The original `/api/agent*` routes still return 403, and the assistant has no unrestricted agent capability. Its answers do not steer or generate with Qwen, and it performs no actions.
+
+Verified on the deployment (root, real question about the Cookie Monster recipe): it returned HTTP 200 with canonical Haiku 5.5 and `tools_enabled: false`; CORS for 8791 OPTIONS returned 204 and a foreign origin 403; legacy agent overview/sessions returned 403; the wrapper's injected tail and assets match their hashes. All three GPU models stayed resident with no cold reload.
+
+Generation controls: greedy decoding normally ignores the seed. Max new tokens (default 160, maximum 1024) applies separately to the baseline and steered runs, so each send can generate up to 2× the capped new tokens. The 4096 input context is a separate limit; the output control does not change it.
+
+**Five custom Qwen3.8-27B personas: DONE (exploratory).** A delegated coding agent (OpenRouter, model `deepseek/deepseek-v4-pro-0813`) authored exactly five custom 27B presets, persisted them through the lab API and ran 15 fresh 64-token comparisons (three prompts each). No repetition loops were observed under that 64-token cap only; the cap is short, so this is not a robustness result. Several outputs do not clearly express their named target.
+
+| Name (exact) | Custom ID | Basis |
+|---|---|---|
+| Impatient Evil Qwen (mild single-neuron) | `custom:759fad57730f499094ba5b8ce8f2ef58` | one neuron, lower dose |
+| Prankster With One Big Toe Removed | `custom:bff6084544084524b2e94335ec1d96a7` | 27 neurons, one set to 0.0 |
+| Poet (softer dose) | `custom:b68d438ca9114b29b8452cbfe4805d66` | one neuron, softer dose |
+| Interior Stylist (mild dose) | `custom:9937540baebb4960ac38b79d6001edb0` | one neuron, milder dose |
+| Rigid English Teacher (mild multi-neuron) | `custom:241b12c58826468c94df944c913b976e` | 3 neurons, doses ~20% lower |
+
+Poet and Rigid English Teacher showed the strongest identity in the samples; the other three are exploratory and their targets are weak in places. **Find them in the UI:** filter source **My personas**, model **Qwen3.8-27B**, and **all** validation states. Their status is `pending`: the full standardized validation batch has not accepted them. No weights were trained, and the name does not discover neurons; each preset is a saved steering configuration derived from a published parent recipe.
+
+Exact records are in [`data/custom/qwen3.8-27b-personas.json`](data/custom/qwen3.8-27b-personas.json). Evidence (`outputs/today-five-q27-personas.md` and `.json`) is a local, untracked file and is not linked. To import on another replica, see "Import the five custom 27B personas" in [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Verified GPU deployment
 
