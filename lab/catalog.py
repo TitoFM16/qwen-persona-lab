@@ -90,14 +90,46 @@ class Catalog:
         rid = source + ':' + source_key
         name = lowered.get('name') or lowered.get('persona') or lowered.get('personality') or lowered.get('title') or source_key
         now=time.time()
-        old=self.db.execute('SELECT raw_json,status FROM recipes WHERE id=?',(rid,)).fetchone()
-        status=old['status'] if old and old['raw_json']==dumps(raw) else 'pending'
-        self.db.execute('''INSERT INTO recipes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(id) DO UPDATE SET name=excluded.name,model=excluded.model,description=excluded.description,
-         neurons_json=excluded.neurons_json,method_json=excluded.method_json,normalization=excluded.normalization,
-         raw_json=excluded.raw_json,status=excluded.status,updated_at=excluded.updated_at''',
-         (rid,source_key,str(name),str(model),str(lowered.get('description', lowered.get('desc',''))),dumps(neurons),dumps(method),normalization,source,dumps(raw),status,now,now))
-        self.db.commit()
+        def effective_method(value):
+            return dict({'op':'add','apply_to':'all_tokens','site':'mlp.down_proj.input'},**value)
+        intervention = {'model':str(model),'components':neurons,'method':effective_method(method),
+                        'normalization':normalization}
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            old=self.db.execute('SELECT * FROM recipes WHERE id=?',(rid,)).fetchone()
+            previous = None if old is None else {
+                'model':old['model'],'components':json.loads(old['neurons_json']),
+                'method':effective_method(json.loads(old['method_json'])),
+                'normalization':old['normalization']}
+            changed = old is not None and previous != intervention
+            status = old['status'] if old and not changed else 'pending'
+            if changed:
+                # A stale worker could otherwise commit an old-intervention answer
+                # into a freshly reset job. Finish/recover it before refreshing.
+                if self.db.execute("SELECT 1 FROM jobs WHERE recipe_id=? AND status='running' LIMIT 1",(rid,)).fetchone():
+                    raise ValueError('Finish/recover running jobs before changing intervention')
+                snapshot=self._recipe(old)
+                for job in self.db.execute("SELECT * FROM jobs WHERE recipe_id=? AND status IN ('completed','failed') ORDER BY id",(rid,)).fetchall():
+                    original=dict(job)
+                    try: result=json.loads(job['result_json']) if job['result_json'] is not None else None
+                    except ValueError: result=None
+                    archived=dict(result) if isinstance(result,dict) else {'original_result':result}
+                    archived['archive']={
+                        'kind':'superseded_validation_result','reason':'intervention_changed_on_catalog_refresh',
+                        'recipe_snapshot':snapshot,'job_snapshot':original,'superseded_by':intervention}
+                    self.db.execute('INSERT INTO experiments(recipe_id,model,prompt,result_json,created_at) VALUES (?,?,?,?,?)',
+                                    (rid,old['model'],job['prompt'],dumps(archived),now))
+                self.db.execute("""UPDATE jobs SET status='pending',attempts=0,worker=NULL,lease_until=NULL,
+                                error=NULL,result_json=NULL,updated_at=? WHERE recipe_id=?""",(now,rid))
+            self.db.execute('''INSERT INTO recipes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,model=excluded.model,description=excluded.description,
+             neurons_json=excluded.neurons_json,method_json=excluded.method_json,normalization=excluded.normalization,
+             raw_json=excluded.raw_json,status=excluded.status,updated_at=excluded.updated_at''',
+             (rid,source_key,str(name),str(model),str(lowered.get('description', lowered.get('desc',''))),dumps(neurons),dumps(method),normalization,source,dumps(raw),status,now,now))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
         return rid
 
     def import_csv(self, path, source='manual', default_model=None):

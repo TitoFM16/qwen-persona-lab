@@ -83,7 +83,8 @@ def run(db='data/lab.sqlite3', model=None, device='cuda', max_jobs=0, max_new_to
                 result = runtime.compare(
                     recipe['model'], job['prompt'], recipe.get('components', recipe.get('neurons', [])),
                     normalization=recipe.get('normalization') or 'neuronary',
-                    method=recipe.get('method') or {}, max_new_tokens=max_new_tokens, seed=job['seed'])
+                    method=recipe.get('method') or {}, max_new_tokens=max_new_tokens, seed=job['seed'],
+                    cache_baseline=True)
                 prior = _previous_outputs(db, job['recipe_id'], job['prompt'])
                 result['metrics']['consistency_prior_runs'] = len(prior)
                 result['metrics']['consistency_exact_match_fraction'] = (

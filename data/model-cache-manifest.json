@@ -1,0 +1,152 @@
+{
+  "observed_at": "2026-11-13T03:24:49.250727+00:00",
+  "resolution": "Post-run immutable local Hugging Face cache inventory; older inference reports retain their original null revision fields. The cache started empty on this rental.",
+  "models": {
+    "Qwen/Qwen3.5-4B": {
+      "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+      "snapshot_count": 1,
+      "config_sha256": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+      "weights": [
+        {
+          "name": "model.safetensors-00001-of-00002.safetensors",
+          "bytes": 5329398688,
+          "cache_blob_key": "ee0b877989c3a7033c9cc3fd0d7d35a18a20933e638d633c9574a68f2a3e9662"
+        },
+        {
+          "name": "model.safetensors-00002-of-00002.safetensors",
+          "bytes": 3990429408,
+          "cache_blob_key": "459e5ad6a11910cf98f0111cab7044f22e9d6bb9e7e62a18c5185af008ed4249"
+        }
+      ]
+    },
+    "Qwen/Qwen3-8B": {
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "snapshot_count": 1,
+      "config_sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+      "weights": [
+        {
+          "name": "model-00001-of-00005.safetensors",
+          "bytes": 3996250744,
+          "cache_blob_key": "d5896122818183507065a14a89ab73d7c90784031154ad074896049c30f607d7"
+        },
+        {
+          "name": "model-00002-of-00005.safetensors",
+          "bytes": 3993160032,
+          "cache_blob_key": "9a29f7c79ee4a1e5902d54bd8197bd28a4facd1f7b79c71c2321dee7a758e34b"
+        },
+        {
+          "name": "model-00003-of-00005.safetensors",
+          "bytes": 3959604768,
+          "cache_blob_key": "eb5ff94ab9f166bee2bde126be1685b655f9857949505ab9ef0f20b522e6f200"
+        },
+        {
+          "name": "model-00004-of-00005.safetensors",
+          "bytes": 3187841392,
+          "cache_blob_key": "03e5a8f00169473ee4be2b67cf8ce228bd13ea708b211424c7527ad2a062900c"
+        },
+        {
+          "name": "model-00005-of-00005.safetensors",
+          "bytes": 1244659840,
+          "cache_blob_key": "00fc0074a30b3f49de8ac046752beeb14efe64c145ff83879c04888b6c1a51d8"
+        }
+      ]
+    },
+    "Qwen/Qwen3.8-27B": {
+      "revision": "37561816e66b5b9153b1b64c10968c18c1e6f4a0",
+      "snapshot_count": 1,
+      "config_sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+      "weights": [
+        {
+          "name": "model-00001-of-00018.safetensors",
+          "bytes": 3966730552,
+          "cache_blob_key": "6026d6bb4baa574f54205e2894816127bcf444bb4f727aa76a4fd3c90e810140"
+        },
+        {
+          "name": "model-00002-of-00018.safetensors",
+          "bytes": 3043080328,
+          "cache_blob_key": "9c56e976ca79eb9ff5c91e64f51cdefb5f6b2651c96d8569df49033f79642d78"
+        },
+        {
+          "name": "model-00003-of-00018.safetensors",
+          "bytes": 2542796952,
+          "cache_blob_key": "25dbcd3a3e6ffa886f2113a11f2960806a7cb16029232bd7fa29b8ef56f47dba"
+        },
+        {
+          "name": "model-00004-of-00018.safetensors",
+          "bytes": 3988973152,
+          "cache_blob_key": "66a8888c9a4bad0b8e450c82effb3f79d57ba20f1d85cc9108175e94ac140de8"
+        },
+        {
+          "name": "model-00005-of-00018.safetensors",
+          "bytes": 2099339864,
+          "cache_blob_key": "4591cd5a10b4eb6243ed33bb9b266314305b61a25b9414e8be1b96cf5361f7f9"
+        },
+        {
+          "name": "model-00006-of-00018.safetensors",
+          "bytes": 3979553696,
+          "cache_blob_key": "ea6d40067bf102178c2e666278354066fe975f039278ee54e3db90de012bbe34"
+        },
+        {
+          "name": "model-00007-of-00018.safetensors",
+          "bytes": 2108759344,
+          "cache_blob_key": "a246b410f148cf8c56d5d34b8c7bb5b3e559d47c25663347e15c7ab580408a36"
+        },
+        {
+          "name": "model-00008-of-00018.safetensors",
+          "bytes": 3979553696,
+          "cache_blob_key": "32f7508f3f22f0f9aa5ddd5fd842df5cfd06f517d5b3bfb05a97e55ec8e12370"
+        },
+        {
+          "name": "model-00009-of-00018.safetensors",
+          "bytes": 2108759344,
+          "cache_blob_key": "a5839f6a8e20769a67bd7275109cf7634935aa33d1e412384f1868b5f3480fa2"
+        },
+        {
+          "name": "model-00010-of-00018.safetensors",
+          "bytes": 3979553696,
+          "cache_blob_key": "ae49938ccc855ea88d41d91824d57f6f88890629c070c85498e3f1a927d46d19"
+        },
+        {
+          "name": "model-00011-of-00018.safetensors",
+          "bytes": 2108759344,
+          "cache_blob_key": "57e280b907e917b6bd5dcc21e8033095d6dbb6ca582f77041997994584f18092"
+        },
+        {
+          "name": "model-00012-of-00018.safetensors",
+          "bytes": 3979553696,
+          "cache_blob_key": "a72c94c82909dc5cfd14b8df1493a73fe4ffd4cbadb0bb8380584e12214b09a4"
+        },
+        {
+          "name": "model-00013-of-00018.safetensors",
+          "bytes": 2108759344,
+          "cache_blob_key": "f165c39bec94c28be80ddfe9232a096396b7ab27e6c05d21be20ad52d8494d2a"
+        },
+        {
+          "name": "model-00014-of-00018.safetensors",
+          "bytes": 3979553696,
+          "cache_blob_key": "5af32c2cee1783cd9cddfdec9cec66bd27ee3d82bd47276a39739d355c9c716c"
+        },
+        {
+          "name": "model-00015-of-00018.safetensors",
+          "bytes": 2108759344,
+          "cache_blob_key": "5018c69ce6ae1996c2d72a22ab4d0100d7724ea8f408489434b00a6f72456f8d"
+        },
+        {
+          "name": "model-00016-of-00018.safetensors",
+          "bytes": 3979564040,
+          "cache_blob_key": "a388a1515e4e5ed6868514ad34b893a0894d3ce30c0537ffdedd830e3ae293e4"
+        },
+        {
+          "name": "model-00017-of-00018.safetensors",
+          "bytes": 2108759344,
+          "cache_blob_key": "061688bf6eceb81886ee32a5c4a8ad96757bd158ca40865c71fe29eb453ee6ac"
+        },
+        {
+          "name": "model-00018-of-00018.safetensors",
+          "bytes": 3392197344,
+          "cache_blob_key": "292e3e23b96b24c89622eef7ddc1e89b2bcd76765e6cf97c4f43316d2d02a43c"
+        }
+      ]
+    }
+  }
+}

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from lab.server import Application, handler
@@ -13,7 +14,9 @@ class ServerTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.app=Application(str(Path(self.temp.name)/'lab.sqlite3'))
+        self.worker_file=Path(self.temp.name)/'worker-status.json'
+        self.judge_file=Path(self.temp.name)/'judge-status.json'
+        self.app=Application(str(Path(self.temp.name)/'lab.sqlite3'),worker_status_file=self.worker_file,judge_status_file=self.judge_file)
         self.addCleanup(self.app.close_catalog)
         self.app.post('/api/import',{'csv':'name,model,recipe\nTest,Qwen/Qwen3-8B,L8N100+0.5\n'})
         self.recipe=self.app.get('/api/recipes',{})['recipes'][0]
@@ -71,6 +74,55 @@ class ServerTests(unittest.TestCase):
         body=json.dumps({'recipe_ids':[self.recipe['id']]}).encode()
         self.assertEqual(self.request('POST','/api/queue',{'Host':'127.0.0.1:8787','Origin':'http://127.0.0.1:8787',
           'X-Lab-Request':'1','Content-Length':str(len(body)),'Content-Type':'application/json'},body)[0],200)
+
+    def test_chat_rejects_active_worker_before_loading_another_model(self):
+        self.worker_file.write_text(json.dumps({'updated_at':time.time(),'state':'completed','runtime':{'loaded':True}}))
+        body=json.dumps({'model':'Qwen/Qwen3-8B','prompt':'Who are you?','components':[]}).encode()
+        headers={'Host':'127.0.0.1:8787','Origin':'http://127.0.0.1:8787',
+                 'X-Lab-Request':'1','Content-Length':str(len(body)),'Content-Type':'application/json'}
+        response=self.request('POST','/api/compare',headers,body)
+        self.assertEqual(response[0],409)
+        self.assertIn('after the batch',response[1]['error'])
+        self.assertIsNone(self.app._runtime)
+        self.assertFalse(self.app.status()['live_chat_available'])
+        for state,loaded,age,blocked in [('loading_or_inference',False,0,True),('stopped',True,0,False),
+                                         ('completed',True,60,False),('idle',False,0,False)]:
+            self.worker_file.write_text(json.dumps({'updated_at':time.time()-age,'state':state,'runtime':{'loaded':loaded}}))
+            self.assertEqual(self.app.status()['live_chat_available'],not blocked)
+
+    def test_chat_rejects_active_judge_before_loading_another_model(self):
+        self.worker_file.write_text(json.dumps({'updated_at':time.time(),'state':'stopped','runtime':{'loaded':False}}))
+        body=json.dumps({'model':'Qwen/Qwen3-8B','prompt':'Who are you?','components':[]}).encode()
+        headers={'Host':'127.0.0.1:8787','Origin':'http://127.0.0.1:8787',
+                 'X-Lab-Request':'1','Content-Length':str(len(body)),'Content-Type':'application/json'}
+        for state,loaded,age,blocked in [('loading_or_reviewing',False,0,True),('loaded',True,0,True),
+                                         ('stopped',True,0,False),('loading_or_reviewing',True,60,False)]:
+            self.judge_file.write_text(json.dumps({'updated_at':time.time()-age,'state':state,'loaded':loaded,
+                                                'model':'Qwen/Qwen3.8-27B','batch_progress':{'judged_unique_cases':3,'unique_cases_total':10}}))
+            status=self.app.status()
+            self.assertEqual(status['live_chat_available'],not blocked)
+            self.assertEqual(status['judge']['batch_progress']['judged_unique_cases'],3)
+            if blocked:
+                response=self.request('POST','/api/compare',headers,body)
+                self.assertEqual(response[0],409)
+                self.assertIn('GPU review is active',response[1]['error'])
+                self.assertIsNone(self.app._runtime)
+
+    def test_catalog_only_prevents_model_loading_and_preserves_browsing(self):
+        self.app.catalog_only=True
+        self.app.catalog.record_experiment(self.recipe['id'],self.recipe['model'],'Who are you?',
+                                           {'baseline':'Recorded baseline','steered':'Recorded steered'})
+        status=self.app.status()
+        self.assertFalse(status['live_chat_available'])
+        self.assertIn('Catalog-only mode',status['live_chat_block_reason'])
+        body=json.dumps({'model':self.recipe['model'],'prompt':'Who are you?','components':[]}).encode()
+        response=self.request('POST','/api/compare',{'Host':'127.0.0.1:8787','Origin':'http://127.0.0.1:8787',
+                              'X-Lab-Request':'1','Content-Length':str(len(body)),'Content-Type':'application/json'},body)
+        self.assertEqual(response[0],409)
+        self.assertIsNone(self.app._runtime)
+        self.assertEqual(len(self.app.get('/api/recipes',{})['recipes']),1)
+        self.assertEqual(self.app.get('/api/history',{})['experiments'][0]['result']['baseline'],'Recorded baseline')
+        self.assertEqual(self.app.post('/api/queue',{'recipe_ids':[self.recipe['id']]})['queued'],8)
 
     def test_actual_published_atlas_integrity_and_hit_mapping(self):
         path=Path('data/sources/neuronpersonas/atlas.json')

@@ -1,0 +1,12 @@
+{
+  "neuron-explorer": {
+    "url": "https://codeload.github.com/lyramakesmusic/neuron-explorer/tar.gz/refs/heads/main",
+    "sha256": "5e82f7ecd47f0cdb273f8b73df2787b164cf81a43134be95618deb5519695103",
+    "source": "official GitHub main archive retrieved during implementation; full archive cached locally"
+  },
+  "neuronary": {
+    "url": "https://codeload.github.com/lyramakesmusic/neuronary/tar.gz/refs/heads/main",
+    "sha256": "da0fcf662cbd7c08f7701bfc324ff3528a53f80a5fc942bec377af0f4b1afa53",
+    "source": "official GitHub main archive retrieved during implementation; full archive cached locally"
+  }
+}

@@ -1,4 +1,4 @@
-import csv,json,tempfile,time,unittest
+import csv,json,sqlite3,tempfile,time,unittest
 from pathlib import Path
 from lab.catalog import Catalog,parse_neurons
 from scripts.sync_catalogs import sync_neuronary,import_personas
@@ -12,6 +12,58 @@ class CatalogTests(unittest.TestCase):
   raw=self.recipe();rid=self.c.upsert(raw,'neuronary');r=self.c.get_recipe(rid)
   self.assertEqual(r['neurons'],raw['neurons']);self.assertEqual(r['raw'],raw);self.assertEqual(r['normalization'],'neuronary')
   self.c.upsert(raw,'neuronary');self.assertEqual(self.c.counts()['imported'],1)
+ def test_metadata_refresh_preserves_completed_validation(self):
+  raw=self.recipe();rid=self.c.upsert(raw,'neuronary');self.c.enqueue([rid],['Who are you?'],1)
+  job=self.c.claim_job();self.c.complete_job(job['id'],{'baseline':'A','steered':'B'})
+  before=dict(self.c.db.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone())
+  refreshed=dict(raw,name='Updated label',description='More source detail',examples=[{'output':'source example'}])
+  refreshed['method']={'op':'add','apply_to':'all_tokens','site':'mlp.down_proj.input'}
+  self.c.upsert(refreshed,'neuronary')
+  self.assertEqual(self.c.get_recipe(rid)['status'],'completed')
+  self.assertEqual(self.c.get_recipe(rid)['raw'],refreshed)
+  self.assertEqual(dict(self.c.db.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()),before)
+  self.assertEqual(self.c.list_experiments(),[])
+ def test_dose_refresh_archives_old_evidence_and_resets_jobs(self):
+  raw=self.recipe();rid=self.c.upsert(raw,'neuronary');self.c.enqueue([rid],['Who are you?'],2)
+  job=self.c.claim_job();self.c.complete_job(job['id'],{'baseline':'A','steered':'B','provenance':{'model_revision':'old'}})
+  job=self.c.claim_job();self.c.fail_job(job['id'],'old failure')
+  original_jobs=[dict(row) for row in self.c.db.execute('SELECT * FROM jobs ORDER BY id')]
+  changed=self.recipe();changed['neurons'][0]['dose']=-.125
+  self.c.upsert(changed,'neuronary')
+  self.assertEqual(self.c.get_recipe(rid)['status'],'pending')
+  self.assertEqual(self.c.get_recipe(rid)['raw'],changed)
+  for row in self.c.db.execute('SELECT * FROM jobs'):
+   self.assertEqual(row['status'],'pending');self.assertEqual(row['attempts'],0)
+   for key in ['result_json','error','worker','lease_until']:self.assertIsNone(row[key])
+  archives=sorted(self.c.list_experiments(),key=lambda row:row['result']['archive']['job_snapshot']['id'])
+  self.assertEqual(len(archives),2)
+  for archived,original in zip(archives,original_jobs):
+   evidence=archived['result']['archive']
+   self.assertEqual(evidence['job_snapshot'],original)
+   self.assertEqual(evidence['recipe_snapshot']['components'],raw['neurons'])
+   self.assertEqual(evidence['recipe_snapshot']['raw'],raw)
+   self.assertEqual(evidence['superseded_by']['components'],changed['neurons'])
+  self.assertEqual(archives[0]['result']['steered'],'B')
+  self.assertEqual(self.c.claim_job()['recipe']['components'],changed['neurons'])
+ def test_intervention_refresh_rejects_active_job_atomically(self):
+  raw=self.recipe();rid=self.c.upsert(raw,'neuronary');self.c.enqueue([rid],['Who are you?'],1)
+  job=self.c.claim_job();before=dict(self.c.db.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone())
+  changed=self.recipe();changed['neurons'][0]['dose']=.5
+  with self.assertRaisesRegex(ValueError,'running jobs'):self.c.upsert(changed,'neuronary')
+  self.assertEqual(self.c.get_recipe(rid)['raw'],raw)
+  self.assertEqual(dict(self.c.db.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()),before)
+  self.assertEqual(self.c.list_experiments(),[])
+ def test_refresh_archive_and_reset_roll_back_together(self):
+  raw=self.recipe();rid=self.c.upsert(raw,'neuronary');self.c.enqueue([rid],['Who are you?'],1)
+  job=self.c.claim_job();self.c.complete_job(job['id'],{'baseline':'A','steered':'B'})
+  before=dict(self.c.db.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone())
+  self.c.db.execute("CREATE TRIGGER reject_update BEFORE UPDATE ON recipes BEGIN SELECT RAISE(ABORT,'fixture rejection'); END")
+  changed=self.recipe();changed['neurons'][0]['dose']=.5
+  with self.assertRaises(sqlite3.IntegrityError):self.c.upsert(changed,'neuronary')
+  self.assertEqual(self.c.get_recipe(rid)['raw'],raw)
+  self.assertEqual(self.c.get_recipe(rid)['status'],'completed')
+  self.assertEqual(dict(self.c.db.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()),before)
+  self.assertEqual(self.c.list_experiments(),[])
  def test_signed_csv(self):
   p=Path(self.tmp.name)/'input.csv';p.write_text('layer,neuron,sign,strength,persona\n8,99,-1,0.75,Coffee\n8,99,1,1.25,Tea\n')
   report=self.c.import_csv(p,source='neuronpersonas-manual',default_model='Qwen/Qwen3-8B')

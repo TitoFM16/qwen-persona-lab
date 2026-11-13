@@ -13,5 +13,7 @@ vendor/
 data/sources/
 data/*.csv
 data/*.json
+!data/starter/
+!data/starter/*.csv
 !data/*report.json
 !data/*manifest.json

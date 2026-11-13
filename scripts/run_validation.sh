@@ -5,9 +5,9 @@ cd "$(dirname "$0")/.."
 mkdir -p outputs
 export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 token_limit="${MAX_NEW_TOKENS:-96}"
-for model in Qwen/Qwen3.5-4B Qwen/Qwen3-8B Qwen/Qwen3.8-27B; do
-  label="${model#Qwen/}"
-  for source in starter neuronary; do
+for source in starter neuronary; do
+  for model in Qwen/Qwen3.5-4B Qwen/Qwen3-8B Qwen/Qwen3.8-27B; do
+    label="${model#Qwen/}"
     .venv/bin/python -m lab.worker --model "$model" --source "$source" \
       --max-new-tokens "$token_limit" 2>&1 | tee -a "outputs/validation-${label}-${source}.log"
   done

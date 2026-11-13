@@ -12,16 +12,22 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parent / 'static'
 MODELS = ['Qwen/Qwen3.5-4B', 'Qwen/Qwen3-8B', 'Qwen/Qwen3.8-27B']
 
+class WorkerBusyError(RuntimeError):
+    pass
+
 class Application:
-    def __init__(self, db_path, device='cuda'):
+    def __init__(self, db_path, device='cuda', worker_status_file=None, judge_status_file=None, catalog_only=False):
         from lab.catalog import Catalog
         self.db_path = db_path
         self._catalog_local = threading.local()
         initial = Catalog(db_path)
         initial.db.close()
         self.device = device
+        self.catalog_only = catalog_only
         self._runtime = None
         self._runtime_lock = threading.Lock()
+        self.worker_status_file = Path(worker_status_file) if worker_status_file else ROOT.parent.parent / '.state/worker-status.json'
+        self.judge_status_file = Path(judge_status_file) if judge_status_file else ROOT.parent.parent / '.state/judge-status.json'
 
     @property
     def catalog(self):
@@ -43,6 +49,45 @@ class Application:
                 self._runtime = ModelRuntime(device=self.device)
             return self._runtime
 
+    @staticmethod
+    def read_telemetry(path):
+        try:
+            status = json.loads(path.read_text())
+            if not isinstance(status, dict): raise ValueError('Malformed GPU status')
+            status['stale'] = time.time() - float(status.get('updated_at', 0)) > 45
+            return status
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, TypeError):
+            return {'state': 'unavailable', 'stale': True}
+
+    def worker_status(self):
+        return self.read_telemetry(self.worker_status_file)
+
+    def judge_status(self):
+        return self.read_telemetry(self.judge_status_file)
+
+    @staticmethod
+    def worker_owns_gpu(worker):
+        if not worker or worker.get('stale') or worker.get('state') == 'stopped':
+            return False
+        return worker.get('state') == 'loading_or_inference' or bool(worker.get('runtime', {}).get('loaded'))
+
+    @staticmethod
+    def judge_owns_gpu(judge):
+        if not judge or judge.get('stale') or judge.get('state') == 'stopped':
+            return False
+        return judge.get('state') == 'loading_or_reviewing' or bool(judge.get('loaded'))
+
+    def live_chat_block_reason(self, worker, judge):
+        if self.catalog_only:
+            return 'Catalog-only mode: browse recorded comparisons; live generation is paused.'
+        if self.judge_owns_gpu(judge):
+            return 'GPU review is active. Live chat and comparisons are available after the review finishes.'
+        if self.worker_owns_gpu(worker):
+            return 'GPU validation is active. Live chat and comparisons are available after the batch finishes.'
+        return None
+
     def status(self):
         runtime = {'loaded': False, 'device': self.device, 'model': None}
         if self._runtime is not None:
@@ -51,15 +96,11 @@ class Application:
                 runtime = status() if callable(status) else status
             except Exception as exc:
                 runtime = {'loaded': False, 'error': str(exc), 'device': self.device}
-        worker = None
-        telemetry_path = ROOT.parent.parent / '.state/worker-status.json'
-        if telemetry_path.is_file():
-            try:
-                worker = json.loads(telemetry_path.read_text())
-                worker['stale'] = time.time() - float(worker.get('updated_at', 0)) > 45
-            except (OSError, ValueError, TypeError):
-                worker = {'state': 'unavailable', 'stale': True}
-        return {'counts': self.catalog.stats(), 'runtime': runtime, 'worker': worker, 'models': MODELS,
+        worker = self.worker_status()
+        judge = self.judge_status()
+        block_reason = self.live_chat_block_reason(worker, judge)
+        return {'counts': self.catalog.stats(), 'runtime': runtime, 'worker': worker, 'judge': judge,
+                'live_chat_available': block_reason is None, 'live_chat_block_reason': block_reason, 'models': MODELS,
                 'atlas': {'Qwen/Qwen3.5-4B': {'available': False, 'assets_present': (ROOT.parent.parent / 'vendor/neuron-explorer/explorer/cache').exists(), 'reason': 'Original upstream 3D source and assets are preserved under vendor/neuron-explorer. Launch its local server separately using the documented safe launcher, then forward port 8791.'},
                           'Qwen/Qwen3-8B': {'available': (ROOT.parent.parent / 'data/sources/neuronpersonas/atlas.json').is_file(), 'reason': 'Published model-specific 2D neuron atlas imported from neuronpersonas.com. This is an indexed category atlas, not a 3D embedding.'},
                           'Qwen/Qwen3.8-27B': {'available': False, 'reason': 'No verified model-specific visualization data. Steering support must be validated on GPU.'}}}
@@ -97,6 +138,9 @@ class Application:
             count = self.catalog.enqueue(recipe_ids=ids, repeats=max(1,min(5,int(body.get('repeats',2)))))
             return {'queued': count}
         if path == '/api/compare':
+            block_reason = self.live_chat_block_reason(self.worker_status(), self.judge_status())
+            if block_reason:
+                raise WorkerBusyError(block_reason)
             model = body.get('model')
             if model not in MODELS: raise ValueError('Unsupported model')
             prompt = body.get('prompt','')
@@ -161,6 +205,7 @@ def handler(app):
                 if not isinstance(body,dict): raise ValueError('JSON object required')
                 self.send_data(200,app.post(urlparse(self.path).path,body))
             except LookupError as exc: self.send_data(404,{'error':str(exc)})
+            except WorkerBusyError as exc: self.send_data(409,{'error':str(exc)})
             except (ValueError,TypeError) as exc: self.send_data(400,{'error':str(exc)})
             except Exception as exc: self.send_data(503,{'error':str(exc),'hint':'Inference requires a configured GPU runtime and downloaded official model weights.'})
     return Handler
@@ -171,8 +216,9 @@ def main():
     parser.add_argument('--db',default='data/lab.sqlite3')
     parser.add_argument('--port',type=int,default=8787)
     parser.add_argument('--device',default='cuda')
+    parser.add_argument('--catalog-only',action='store_true',help='Browse catalogs and recorded results without loading any model')
     args=parser.parse_args()
-    server=ThreadingHTTPServer(('127.0.0.1',args.port),handler(Application(args.db,args.device)))
+    server=ThreadingHTTPServer(('127.0.0.1',args.port),handler(Application(args.db,args.device,catalog_only=args.catalog_only)))
     print(f'Qwen Persona Laboratory: http://127.0.0.1:{args.port}',flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass

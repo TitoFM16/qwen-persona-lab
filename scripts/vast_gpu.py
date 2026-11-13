@@ -29,13 +29,27 @@ def offers():
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action',choices=['offers','rent','status','destroy'])
+    p.add_argument('action',choices=['offers','rent','status','start','stop','destroy'])
     p.add_argument('id',nargs='?',type=int)
     p.add_argument('--key',default='~/.ssh/id_ed25519.pub')
+    p.add_argument('--env-file',help='Read only VAST_AI_API_KEY from an existing env file; never execute its contents')
     a=p.parse_args()
+    if a.env_file:
+        for line in Path(a.env_file).expanduser().read_text().splitlines():
+            key, separator, value = line.partition('=')
+            if separator and key.strip().removeprefix('export ') == 'VAST_AI_API_KEY':
+                value = value.strip()
+                if len(value)>1 and value[0] == value[-1] and value[0] in '\"\'':
+                    value = value[1:-1]
+                os.environ['VAST_AI_API_KEY'] = value
+                break
+        else: raise SystemExit('VAST_AI_API_KEY not found in env file')
     if a.action=='offers':
         print(json.dumps([{k:o.get(k) for k in ['id','gpu_name','dph_total','storage_cost','reliability','disk_space']} for o in offers() if 'RTX PRO 6000' in o.get('gpu_name','') and o['dph_total']<2],indent=2))
     elif a.action=='rent':
+        key=Path(a.key).expanduser().read_text().strip()
+        if not key.startswith('ssh-') or 'PRIVATE KEY' in key:
+            raise SystemExit('Provide an SSH public key')
         o=next((o for o in offers() if o['id']==a.id),None)
         if not o or 'RTX PRO 6000' not in o.get('gpu_name',''): raise SystemExit('Offer unavailable or wrong GPU.')
         # Vast storage_cost is dollars per GB per month. Conservatively add full disk charge.
@@ -44,9 +58,22 @@ def main():
         result=request(f'/api/v0/asks/{a.id}/',{'client_id':'me','image':'pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime','disk':180,'runtype':'ssh_direc ssh_proxy','label':'qwen-persona-lab','cancel_unavail':True},'PUT')
         if not result.get('success'): raise SystemExit('Rental rejected: '+str(result.get('msg','unknown error')))
         instance=result['new_contract']
-        key=Path(a.key).expanduser().read_text().strip()
+        # Record the contract before key attachment, so a provider-side failure
+        # cannot leave a paid rental without a locally recorded identifier.
+        Path('.state').mkdir(exist_ok=True)
+        Path('.state/rental.json').write_text(json.dumps({'instance_id':instance,'estimated_hourly_usd':rate},indent=2))
         request(f'/api/v0/instances/{instance}/ssh/',{'ssh_key':key},'POST')
         print(json.dumps({'instance':instance,'estimated_hourly_usd':rate,'note':'Destroy the instance when finished; stopped disk can still incur charges.'}))
+    elif a.action in {'start','stop'}:
+        if a.id is None: p.error('Instance id required')
+        instances=request('/api/v1/instances/?owner=me').get('instances',[])
+        instance=next((o for o in instances if o['id']==a.id),None)
+        if not instance: raise SystemExit('Instance not found in your account')
+        if a.action=='start' and float(instance.get('dph_total',float('inf')))>2:
+            raise SystemExit('Rejected: provider hourly rate exceeds $2')
+        result=request(f'/api/v0/instances/{a.id}/',{'state':'running' if a.action=='start' else 'stopped'},'PUT')
+        print(json.dumps({'success':result.get('success'),'requested_state':a.action,
+                          'note':'Stopped instances retain disk storage charges.'}))
     elif a.action=='destroy':
         if a.id is None: p.error('Instance id required')
         r=request(f'/api/v0/instances/{a.id}/',method='DELETE')

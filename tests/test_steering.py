@@ -2,7 +2,52 @@ import math
 import types
 import unittest
 
-from lab.steering import Intervention, ModelRuntime, decoder_layers, validate_components
+from lab.steering import Intervention, ModelRuntime, decoder_layers, validate_components, resolve_model_revision
+
+
+class RevisionTests(unittest.TestCase):
+    def test_cached_snapshot_and_unresolved_paths(self):
+        from unittest.mock import patch
+        revision = 'a' * 40
+        config = types.SimpleNamespace(_commit_hash=None)
+        with patch('huggingface_hub.try_to_load_from_cache', return_value=f'/cache/models--Qwen--Qwen3-8B/snapshots/{revision}/config.json'):
+            self.assertEqual(resolve_model_revision('Qwen/Qwen3-8B',config),
+                             (revision,'huggingface_cached_config_snapshot'))
+        for cached in [None, object(), '/cache/snapshots/main/config.json']:
+            with patch('huggingface_hub.try_to_load_from_cache',return_value=cached):
+                resolved,reason=resolve_model_revision('Qwen/Qwen3-8B',config)
+                self.assertIsNone(resolved);self.assertTrue(reason)
+        config._commit_hash=revision
+        with patch('huggingface_hub.try_to_load_from_cache',return_value=None):
+            self.assertEqual(resolve_model_revision('Qwen/Qwen3-8B',config),
+                             (revision,'model_config_commit_hash_fallback'))
+
+    def test_load_pins_tokenizer_and_model_to_resolved_snapshot(self):
+        from unittest.mock import Mock, patch
+        import sys
+        revision='b'*40
+        for vision in [False,True]:
+            config=types.SimpleNamespace(_commit_hash=None,vision_config={} if not vision else {'test':True})
+            layer=types.SimpleNamespace(mlp=types.SimpleNamespace(down_proj=types.SimpleNamespace(weight=types.SimpleNamespace(shape=(4096,12288)))))
+            model=types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]*36),config=config)
+            model.eval=lambda:model
+            tokenizer=object()
+            config_loader=Mock();config_loader.from_pretrained.return_value=config
+            tokenizer_loader=Mock();tokenizer_loader.from_pretrained.return_value=tokenizer
+            causal=Mock();causal.from_pretrained.return_value=model
+            multimodal=Mock();multimodal.from_pretrained.return_value=model
+            transformers=types.SimpleNamespace(AutoConfig=config_loader,AutoTokenizer=tokenizer_loader,
+                AutoModelForCausalLM=causal,AutoModelForImageTextToText=multimodal)
+            fake_torch=types.SimpleNamespace(float32='float32',bfloat16='bfloat16',cuda=types.SimpleNamespace(is_available=lambda:False))
+            with patch.dict(sys.modules,{'torch':fake_torch,'transformers':transformers}), \
+                 patch('huggingface_hub.try_to_load_from_cache',return_value=f'/cache/snapshots/{revision}/config.json'):
+                runtime=ModelRuntime(device='cpu');runtime.load('Qwen/Qwen3-8B')
+                self.assertEqual(runtime.model_revision,revision)
+                self.assertEqual(tokenizer_loader.from_pretrained.call_args.kwargs['revision'],revision)
+                loader=multimodal if vision else causal
+                self.assertEqual(loader.from_pretrained.call_args.kwargs['revision'],revision)
+                runtime.unload();self.assertIsNone(runtime.model_revision)
+                self.assertEqual(runtime.model_revision_reason,'model_not_loaded')
 
 
 class Handle:
@@ -186,11 +231,144 @@ except ImportError:
 
 @unittest.skipIf(torch is None, 'PyTorch required for numeric hook integration tests; run on GPU installation')
 class NumericTests(unittest.TestCase):
+    def test_synthetic_cuda_oom_removes_real_hook_and_unloads_runtime(self):
+        # Raise the real exception type on CPU. This checks the software recovery
+        # path without allocating CUDA memory or provoking a hardware OOM.
+        from unittest.mock import patch
+        projection=torch.nn.Linear(2,2,bias=False)
+        runtime=ModelRuntime(device='cpu')
+        runtime.torch=torch
+        runtime.model_id='Qwen/Qwen3-8B'
+        runtime.model_revision='a'*40
+        runtime.model=types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer(projection)]),
+            config=types.SimpleNamespace(_commit_hash=None),dtype=torch.float32,
+            generation_config=types.SimpleNamespace(eos_token_id=63))
+        runtime.tokenizer=types.SimpleNamespace(eos_token_id=63)
+        runtime._medians[0]=1.0;runtime._norm_sources[0]='fixture'
+        runtime._baseline_cache['previous_fixture']=(('older','length',(1,)),0)
+        phases=[]
+        def generate(ids,max_new,intervention=None):
+            phases.append('baseline' if intervention is None else 'steered')
+            if intervention is None:
+                self.assertFalse(projection._forward_pre_hooks)
+                return ('successful baseline','length',[1,2])
+            self.assertTrue(projection._forward_pre_hooks)
+            projection(torch.zeros(1,2,2))  # The installed hook really executes.
+            self.assertEqual(len(runtime._baseline_cache),2)
+            raise torch.cuda.OutOfMemoryError('synthetic CPU-only recovery test')
+        with patch.object(runtime,'load'), \
+             patch.object(runtime,'_encode',return_value=torch.tensor([[1,2,3]])), \
+             patch.object(runtime,'_generate',side_effect=generate), \
+             patch.object(torch.cuda,'is_available',return_value=False):
+            with self.assertRaisesRegex(torch.cuda.OutOfMemoryError,'synthetic CPU-only'):
+                runtime.compare('Qwen/Qwen3-8B','test',[{'layer':0,'neuron':0,'dose':.5}],
+                                normalization='raw',max_new_tokens=3,cache_baseline=True)
+        self.assertEqual(phases,['baseline','steered'])
+        self.assertFalse(projection._forward_pre_hooks)
+        self.assertIsNone(runtime.model);self.assertIsNone(runtime.tokenizer)
+        self.assertIsNone(runtime.model_id);self.assertIsNone(runtime.model_revision)
+        self.assertFalse(runtime._baseline_cache);self.assertFalse(runtime._medians)
+        self.assertFalse(runtime._norm_sources)
+        self.assertIn('OutOfMemoryError',runtime.error)
+
+    def test_worker_synthetic_oom_keeps_failed_job_and_preserves_pending_bound(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from lab.catalog import Catalog
+        from lab.worker import run
+        instances=[]
+        class Runtime:
+            def __init__(self,**kwargs):
+                self.calls=0;self.unloaded=False;instances.append(self)
+            @property
+            def status(self):return {'gpu':None}
+            def compare(self,*args,**kwargs):
+                self.calls+=1
+                if self.calls==1:
+                    raise torch.cuda.OutOfMemoryError('synthetic worker recovery test')
+                return {'baseline':'base','steered':'response','metrics':{},'provenance':{}}
+            def unload(self):self.unloaded=True
+        with tempfile.TemporaryDirectory() as temp:
+            db=str(Path(temp)/'test.sqlite3');catalog=Catalog(db)
+            try:
+                rid=catalog.upsert({'id':'oom','name':'OOM test','model':'Qwen/Qwen3-8B',
+                    'neurons':[{'layer':0,'neuron':0,'dose':.5}]},'fixture')
+                catalog.enqueue([rid],['Who are you?'],repeats=3)
+                with patch('lab.worker.ModelRuntime',Runtime):
+                    report=run(db,max_jobs=2)
+                self.assertEqual(report,{'completed_jobs':1,'failed_jobs':1})
+                self.assertTrue(instances[0].unloaded)
+                rows=[dict(row) for row in catalog.db.execute('SELECT * FROM jobs ORDER BY id')]
+                self.assertEqual([row['status'] for row in rows],['failed','completed','pending'])
+                self.assertIn('OutOfMemoryError',rows[0]['error'])
+                self.assertIn('synthetic worker',rows[0]['error'])
+                self.assertIsNone(rows[0]['result_json'])
+                self.assertEqual(rows[2]['attempts'],0)
+                self.assertEqual(catalog.retry_failed(),1)
+                reclaimed=catalog.claim_job()
+                self.assertEqual(reclaimed['id'],rows[0]['id'])
+                self.assertEqual(reclaimed['attempts'],2)
+                self.assertEqual(catalog.counts()['jobs']['pending'],1)
+                self.assertEqual(catalog.db.execute('SELECT status FROM jobs WHERE id=?',
+                    (rows[1]['id'],)).fetchone()[0],'completed')
+            finally:catalog.close()
+
+    def test_baseline_cache_uses_resolved_revision_when_config_hash_missing(self):
+        from unittest.mock import Mock
+        runtime=ModelRuntime(device='cpu')
+        runtime.model_id='Qwen/Qwen3-8B';runtime.model_revision='a'*40
+        runtime.model=types.SimpleNamespace(config=types.SimpleNamespace(_commit_hash=None),
+            dtype=torch.float32,generation_config=types.SimpleNamespace(eos_token_id=63))
+        runtime.tokenizer=types.SimpleNamespace(eos_token_id=63)
+        runtime._generate=Mock(return_value=('baseline','length',[1]))
+        ids=torch.tensor([[1,2,3]])
+        _,first=runtime._baseline(ids,3,0,True)
+        self.assertTrue(runtime._baseline(ids,3,0,True)[1]['hit'])
+        runtime.model_revision='b'*40
+        _,second=runtime._baseline(ids,3,0,True)
+        self.assertFalse(second['hit'])
+        self.assertNotEqual(first['key_sha256'],second['key_sha256'])
+
+    def test_baseline_cache_identity_capacity_and_invalidation(self):
+        from unittest.mock import Mock
+        runtime = ModelRuntime(device='cpu')
+        runtime.model_id = 'Qwen/Qwen3-8B'
+        runtime.model = types.SimpleNamespace(config=types.SimpleNamespace(_commit_hash='revision1'),
+            dtype=torch.float32, generation_config=types.SimpleNamespace(eos_token_id=63))
+        runtime.tokenizer = types.SimpleNamespace(eos_token_id=63)
+        runtime._generate = Mock(return_value=('baseline', 'length', [1, 2]))
+        ids = torch.tensor([[1, 2, 3]])
+        first, meta1 = runtime._baseline(ids, 3, 0, True)
+        second, meta2 = runtime._baseline(ids, 3, 0, True)
+        self.assertFalse(meta1['hit']); self.assertTrue(meta2['hit'])
+        self.assertEqual(meta1['generated_at'], meta2['generated_at'])
+        self.assertEqual(runtime._generate.call_count, 1)
+        second[2].append(99)
+        self.assertEqual(runtime._baseline(ids, 3, 0, True)[0][2], [1, 2])
+        runtime._baseline(ids, 4, 0, True)
+        runtime._baseline(ids, 3, 1, True)
+        runtime._baseline(torch.tensor([[1, 2, 4]]), 3, 0, True)
+        runtime.model.config._commit_hash = 'revision2'
+        runtime._baseline(ids, 3, 0, True)
+        self.assertEqual(runtime._generate.call_count, 5)
+        runtime._baseline(ids, 3, 0, False)
+        self.assertEqual(runtime._generate.call_count, 6)
+        for seed in range(40): runtime._baseline(ids, 3, seed, True)
+        self.assertEqual(len(runtime._baseline_cache), 32)
+        self.assertFalse(runtime._baseline(ids, 3, 0, True)[1]['hit'])
+        runtime.unload()
+        self.assertFalse(runtime._baseline_cache)
+
     def test_native_qwen_cached_decode_calibration_and_hook_cleanup(self):
         # Random tiny native architectures validate API/hook/cache compatibility;
         # they are not pretrained model smoke tests or persona reproductions.
+        import inspect
+        from contextlib import ExitStack
+        from unittest.mock import patch
         try:
             from transformers import Qwen3Config, Qwen3ForCausalLM, Qwen3_5Config, Qwen3_5ForConditionalGeneration
+            from transformers.models.qwen3_5 import modeling_qwen3_5
         except ImportError:
             self.skipTest('Transformers with native Qwen3.5 support required')
         class Tokenizer:
@@ -209,7 +387,17 @@ class NumericTests(unittest.TestCase):
                                'num_heads': 4, 'out_hidden_size': 32})),
         ]
         for loader, config in configs:
-            with self.subTest(architecture=loader.__name__):
+            with self.subTest(architecture=loader.__name__), ExitStack() as patches:
+                if loader == Qwen3_5ForConditionalGeneration:
+                    # Optional FLA/causal-conv packages select GPU kernels at
+                    # import time even though this tiny portability test uses
+                    # CPU tensors. Unwrap only this test's four dispatchers to
+                    # their native Torch references, then restore every symbol.
+                    # Official pretrained GPU smoke checks retain fused kernels.
+                    for name in ('torch_chunk_gated_delta_rule', 'torch_recurrent_gated_delta_rule',
+                                 'causal_conv1d_fn', 'causal_conv1d_update'):
+                        patches.enter_context(patch.object(modeling_qwen3_5, name,
+                            inspect.unwrap(getattr(modeling_qwen3_5, name))))
                 torch.manual_seed(0)
                 model = loader(config).eval()
                 model.generation_config.eos_token_id = 63
@@ -228,6 +416,21 @@ class NumericTests(unittest.TestCase):
                 self.assertEqual(runtime._generate(ids, 3), baseline)
                 self.assertFalse(layers[0].mlp.down_proj._forward_pre_hooks)
                 self.assertFalse(layers[0]._forward_hooks)
+                # Compare's optional cache must save only baseline work; every
+                # steered comparison and default smoke baseline stays fresh.
+                from unittest.mock import patch
+                runtime.model_id = ('Qwen/Qwen3-8B' if loader == Qwen3ForCausalLM else 'Qwen/Qwen3.5-4B')
+                with patch.object(runtime, 'load'), patch.object(runtime, '_encode', return_value=ids), \
+                     patch.object(runtime, '_generate', wraps=runtime._generate) as generate:
+                    a = runtime.compare(runtime.model_id, 'test', [], normalization='raw', max_new_tokens=3, cache_baseline=True)
+                    b = runtime.compare(runtime.model_id, 'test', components, normalization='raw', max_new_tokens=3, cache_baseline=True)
+                    c = runtime.compare(runtime.model_id, 'test', [], normalization='raw', max_new_tokens=3)
+                self.assertEqual(generate.call_count, 5)
+                self.assertEqual(a['baseline'], b['baseline'])
+                self.assertEqual(a['baseline'], c['baseline'])
+                self.assertFalse(a['provenance']['baseline_cache_hit'])
+                self.assertTrue(b['provenance']['baseline_cache_hit'])
+                self.assertFalse(c['provenance']['baseline_cache']['enabled'])
 
     def test_normalized_single_and_multi_direction(self):
         # A residual change has exactly dose * residual_median magnitude for one neuron.

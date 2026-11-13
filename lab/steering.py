@@ -12,8 +12,10 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import threading
 import time
+from collections import OrderedDict
 from difflib import SequenceMatcher
 
 MODELS = {
@@ -30,6 +32,33 @@ CALIBRATION = (
 )
 NORMALIZATIONS = {'neuronary', 'persona_library', 'prompt_residual', 'raw',
                   'layer_residual_median_over_down_column_l2'}
+
+
+def optional_package_version(package):
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def resolve_model_revision(model_id, config):
+    """Resolve an immutable cached config snapshot without a second network lookup."""
+    reason = 'config_json_not_found_in_huggingface_cache'
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        cached = try_to_load_from_cache(model_id, 'config.json')
+        if isinstance(cached, (str, os.PathLike)):
+            parts = Path(cached).parts
+            for index, part in enumerate(parts[:-1]):
+                if part == 'snapshots' and re.fullmatch(r'[0-9a-fA-F]{40}', parts[index + 1]):
+                    return parts[index + 1], 'huggingface_cached_config_snapshot'
+            reason = 'cached_config_path_does_not_contain_an_immutable_snapshot_revision'
+    except Exception as exc:
+        reason = 'huggingface_cache_revision_lookup_failed:' + type(exc).__name__
+    fallback = getattr(config, '_commit_hash', None)
+    if isinstance(fallback, str) and re.fullmatch(r'[0-9a-fA-F]{40}', fallback):
+        return fallback, 'model_config_commit_hash_fallback'
+    return None, reason
 
 
 def validate_components(model_id, components):
@@ -119,9 +148,12 @@ class ModelRuntime:
         self._lock = threading.RLock()
         self.model = self.tokenizer = self.torch = None
         self.model_id = None
+        self.model_revision = None
+        self.model_revision_reason = 'model_not_loaded'
         self.error = None
         self._medians = {}
         self._norm_sources = {}
+        self._baseline_cache = OrderedDict()
 
     @property
     def status(self):
@@ -138,8 +170,11 @@ class ModelRuntime:
         with self._lock:
             self.model = self.tokenizer = None
             self.model_id = None
+            self.model_revision = None
+            self.model_revision_reason = 'model_not_loaded'
             self._medians.clear()
             self._norm_sources.clear()
+            self._baseline_cache.clear()
             gc.collect()
             if self.torch is not None and self.torch.cuda.is_available():
                 self.torch.cuda.empty_cache()
@@ -157,12 +192,14 @@ class ModelRuntime:
             raise RuntimeError('CUDA unavailable; attach a GPU or explicitly choose --device cpu/mps')
         dtype = torch.float32 if self.device == 'cpu' else torch.bfloat16
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        revision, revision_reason = resolve_model_revision(model_id, config)
+        revision_kwargs = {'revision': revision} if revision is not None else {}
         loader = AutoModelForImageTextToText if getattr(config, 'vision_config', None) else AutoModelForCausalLM
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False, **revision_kwargs)
         # Direct placement avoids retaining an entire 27B CPU copy while transferring
         # weights to the GPU. Accelerate is a declared runtime dependency.
         model = loader.from_pretrained(model_id, dtype=dtype, trust_remote_code=False,
-                                       attn_implementation='eager', device_map={'': self.device}).eval()
+                                       attn_implementation='eager', device_map={'': self.device}, **revision_kwargs).eval()
         layers = decoder_layers(model)
         if len(layers) != MODELS[model_id]['layers']:
             raise ValueError('Downloaded model layer count differs from registered architecture')
@@ -170,6 +207,7 @@ class ModelRuntime:
             if layer.mlp.down_proj.weight.shape[1] != MODELS[model_id]['neurons']:
                 raise ValueError('Downloaded MLP shape differs from registered architecture')
         self.model, self.tokenizer, self.model_id = model, tokenizer, model_id
+        self.model_revision, self.model_revision_reason = revision, revision_reason
         self.error = None
         os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
@@ -230,7 +268,7 @@ class ModelRuntime:
         layers, units = decoder_layers(self.model), {}
         for c in components:
             l, n = c['layer'], c['neuron']
-            norm = float(layers[l].mlp.down_proj.weight[:, n].float().norm())
+            norm = float(layers[l].mlp.down_proj.weight[:, n].detach().float().norm())
             if not math.isfinite(norm) or norm <= 0:
                 raise ValueError('Zero or invalid down projection norm')
             units[(l, n)] = medians[l] / norm
@@ -260,8 +298,36 @@ class ModelRuntime:
                                      use_cache=True, logits_to_keep=1)
         return self.tokenizer.decode(tokens, skip_special_tokens=True).strip(), finish, tokens
 
+    def _baseline(self, ids, max_new_tokens, seed, cache_baseline):
+        """Reuse only an actually generated, identical deterministic baseline."""
+        key = None
+        if cache_baseline:
+            identity = [self.model_id, self.model_revision or getattr(self.model.config, '_commit_hash', None),
+                        str(self.model.dtype), self.device, seed, max_new_tokens,
+                        self.model.generation_config.eos_token_id, self.tokenizer.eos_token_id,
+                        ids.detach().cpu().tolist(), 'greedy_batch_one_thinking_off_v1']
+            key = hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
+        hit = cache_baseline and key in self._baseline_cache
+        if hit:
+            output, created_at = self._baseline_cache[key]
+            self._baseline_cache.move_to_end(key)
+        else:
+            output, created_at = self._generate(ids, max_new_tokens), time.time()
+            if cache_baseline:
+                # Strings and CPU token IDs only; never retain model tensors or KV caches.
+                self._baseline_cache[key] = ((output[0], output[1], tuple(output[2])), created_at)
+                while len(self._baseline_cache) > 32:
+                    self._baseline_cache.popitem(last=False)
+        metadata = {'enabled': bool(cache_baseline), 'hit': bool(hit), 'key_sha256': key,
+                    'generated_at': created_at,
+                    'policy': 'Actual unsteered output generated once for identical model revision, input IDs, '
+                              'dtype, device, seed, EOS settings and greedy decoding limit; '
+                              'cleared on unload/model switch. Steered output is always freshly generated.'}
+        return (output[0], output[1], list(output[2])), metadata
+
     def compare(self, model_id, prompt, components, normalization='neuronary', method=None,
-                max_new_tokens=160, seed=0, messages=None, baseline_messages=None, steered_messages=None):
+                max_new_tokens=160, seed=0, messages=None, baseline_messages=None, steered_messages=None,
+                cache_baseline=False):
         components = validate_components(model_id, components)
         method = method or {}
         normalization = method.get('normalization', normalization)
@@ -279,6 +345,7 @@ class ModelRuntime:
             raise ValueError('max_new_tokens must be between 1 and 1024')
         with self._lock:
             start = time.monotonic()
+            comparison_started_at = time.time()
             try:
                 self.load(model_id)
                 torch = self.torch
@@ -290,10 +357,12 @@ class ModelRuntime:
                 if max(ids.shape[-1], baseline_ids.shape[-1]) > 4096:
                     raise ValueError('Chat context exceeds laboratory 4096-token limit')
                 units, medians, norm_source = self._units(ids, components, normalization, op)
-                baseline, base_finish, base_tokens = self._generate(baseline_ids, max_new_tokens)
+                (baseline, base_finish, base_tokens), baseline_cache = self._baseline(
+                    baseline_ids, max_new_tokens, seed, cache_baseline)
                 torch.manual_seed(seed)
                 with Intervention(decoder_layers(self.model), components, units, op, scope) as intervention:
                     steered, steer_finish, steer_tokens = self._generate(ids, max_new_tokens, intervention)
+                generation_completed_at = time.time()
                 metrics = {
                     'changed': baseline != steered,
                     'text_similarity': SequenceMatcher(None, baseline, steered).ratio(),
@@ -305,7 +374,13 @@ class ModelRuntime:
                     'rating_status': 'requires_human_review',
                 }
                 provenance = {
-                    'model': model_id, 'revision': getattr(self.model.config, '_commit_hash', None),
+                    'comparison_started_at_unix': comparison_started_at,
+                    'generation_completed_at_unix': generation_completed_at,
+                    'model': model_id, 'revision': self.model_revision or getattr(self.model.config, '_commit_hash', None),
+                    'revision_resolution': (self.model_revision_reason if self.model_revision is not None or
+                                            getattr(self.model.config, '_commit_hash', None) is None
+                                            else 'model_config_commit_hash_fallback'),
+                    'revision_pinned_for_tokenizer_and_weights': self.model_revision is not None,
                     'components': components, 'normalization': normalization, 'norm_source': norm_source,
                     'residual_medians': medians, 'activation_units': {f'L{l}N{n}': u for (l,n),u in units.items()},
                     'method': {'op': op, 'apply_to': scope, 'site': site}, 'seed': seed, 'decoding': 'greedy',
@@ -316,8 +391,11 @@ class ModelRuntime:
                     'batch_size': 1, 'thinking': False, 'max_new_tokens': max_new_tokens,
                     'baseline_prompt_tokens': baseline_ids.shape[-1], 'steered_prompt_tokens': ids.shape[-1],
                     'independent_chat_histories': baseline_messages is not None or steered_messages is not None,
+                    'baseline_cache_hit': baseline_cache['hit'], 'baseline_cache': baseline_cache,
                     'dtype': str(self.model.dtype), 'device': self.device,
                     'torch': torch.__version__, 'transformers': importlib.metadata.version('transformers'),
+                    'optional_kernels': {package: optional_package_version(package) for package in
+                                         ('fla-core', 'flash-linear-attention', 'causal-conv1d')},
                     'cuda': torch.version.cuda, 'telemetry': self.status,
                     'reproduction_limits': ['No exact-repeat early stop; EOS or token limit only.',
                                             'Greedy batch-one inference; hardware and batch layout may affect strong steering.'],

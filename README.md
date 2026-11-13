@@ -1,126 +1,154 @@
 # Qwen Persona Laboratory
 
-A local catalog, steering engine, experiment queue, and browser interface for Qwen neuron steering. **Implementation is present; GPU acceptance is incomplete.** The development session could download data but could not use SSH, bind a local server socket, or initialize `.git` under its sandbox policy. No model outputs or GPU memory measurements are claimed.
+A local neuron-steering lab with a searchable personality catalog, editable doses, baseline comparisons, chat, persistent experiment history and a resumable SQLite validation queue.
 
-## Start the catalog on your Mac
+Private source repository: [TitoFM16/qwen-persona-lab](https://github.com/TitoFM16/qwen-persona-lab). Credentials, model weights, runtime databases and generated outputs are excluded from Git.
 
-From this directory in an ordinary Terminal:
+## Verified GPU deployment
 
-```bash
-python3 -m lab.server --device mps --port 8787
-```
+All three official models downloaded and passed real baseline, zero-dose, single-neuron, multi-neuron and hook-cleanup smoke checks on a 96 GB RTX PRO 6000. Both reference and optional FLA kernel paths passed.
 
-Open http://127.0.0.1:8787. Catalog browsing requires only Python 3.11+. Inference additionally needs the dependencies below and sufficient model memory; the Mac has not been benchmarked. Use the rented GPU for inference. The UI provides searchable catalog entries, model selection, signed dose edits, baseline comparisons, independent multi-turn chats, CSV import, validation queue, job failures, and experiment history. Live replies currently arrive on completion rather than streaming tokens.
-
-## Imported data
-
-The current SQLite database is `data/lab.sqlite3`. Actual counts and source snapshots are recorded in `data/*-report.json` and `data/sources/`.
-
-| Source | Imported entries |
+| Official model | Observed peak allocation, 32-token smoke |
 |---|---:|
-| Neuronary public paginated API | 262 |
-| Qwen3-8B personas | 34,220 |
-| Qwen3-8B off-topic replies | 35,074 |
-| Qwen3-8B changed-assistant replies | 8,827 |
-| Supplied starter CSV (separate source records) | 36 |
-| Total | 78,419 |
+| `Qwen/Qwen3.5-4B` | 8.53 GiB |
+| `Qwen/Qwen3-8B` | 15.28 GiB |
+| `Qwen/Qwen3.8-27B` | 51.14 GiB |
 
-The Persona Library website's downloadable dataset was obtained directly and exported to `data/qwen3-8b-neuron-personas.csv`. All identities and metadata are searchable. Its response field contains source-provided excerpts, not complete responses; these are never presented as local inference. Neuronary full detail JSON preserves combinations, signed doses, exact model, method, examples and provenance. The API is public and requires no token. No content has been posted to either source.
+Verified environment: NVIDIA driver **615.71.09**, driver CUDA capability **13.4**, PyTorch runtime CUDA **13.0**, **PyTorch 2.9.0+cu130**, **Transformers 5.22.2**, BF16 inference. These are measured smoke-run allocations, not guarantees for longer contexts or simultaneous models. Official weights loaded without remote model code or model-service credentials.
 
-The 36 starter recipes were subsequently supplied as `/Users/juanfigueroa/Downloads/qwen_personality_recipes.csv` and imported with their exact signed components, model IDs, personalities, methods and sources. A snapshot is retained at `data/sources/starter/qwen_personality_recipes.csv`; all 36 rows passed checks and add 288 validation jobs. These source records can overlap the public catalog and are preserved separately. The ZIP, detailed specification and supplied sync script remain unavailable. Import another CSV with:
+Experiment rental **60435160** ran at approximately **US$1.433/hour** and has been **destroyed**; the provider subsequently listed no account instances. Results are saved locally. For tomorrow's live demo, use [the one-command runbook](docs/RUNBOOK.md) to rent under US$2/hour, restore the environment, and destroy it on exit or at its two-hour deadline. The local watchdog requires an awake, connected Mac.
+
+All 36 starter records, 258 supported Neuronary records, and ten Persona Library records completed generation: **2,432 successful comparison jobs**. Four unsupported Neuronary records failed explicitly. Final record counts are **301 completed, 3 reproduced under an exploratory Codex rubric, 4 failed, and 78,111 pending**. The large pending catalog is paused and consumes no GPU time. See [verification](docs/verification.md) and local `outputs/gpu-final/outputs/` for complete evidence. The entire catalog has not been validated.
+
+## Catalog and source fidelity
+
+| Imported source records | Count |
+|---|---:|
+| Neuronary public paginated API, full recipe details | 262 |
+| Persona Library: personas | 34,220 |
+| Persona Library: off-topic replies | 35,074 |
+| Persona Library: changed-assistant replies | 8,827 |
+| Supplied starter CSV | 36 |
+| **Total** | **78,419** |
+
+Starter rows can overlap public recipes and remain distinct source records. The original 36-row CSV is tracked at [`data/starter/qwen_personality_recipes.csv`](data/starter/qwen_personality_recipes.csv). Exact models, signed doses, combinations, method sites and raw metadata are retained. The Persona Library's exported response text is explicitly marked as source excerpts, not locally generated full responses. Source snapshots and SHA-256 provenance are retained locally; see [catalog details](docs/CATALOG.md).
+
+The referenced ZIP, detailed specification and supplied synchronization script were never provided. The starter CSV is present and imported.
+
+## Browse on the Mac
+
+Catalog browsing requires Python 3.11+ and no GPU:
 
 ```bash
-python3 scripts/sync_catalogs.py csv /path/to/starter.csv --source starter --model Qwen/Qwen3.5-4B
-```
-
-Every raw row is preserved. An unspecified normalization must be selected explicitly before steering. Refresh and queue public sources:
-
-```bash
+git clone git@github.com:TitoFM16/qwen-persona-lab.git
+cd qwen-persona-lab
 python3 scripts/sync_catalogs.py neuronary
 python3 scripts/sync_catalogs.py personas
+python3 scripts/sync_catalogs.py csv data/starter/qwen_personality_recipes.csv --source starter
 python3 scripts/sync_catalogs.py queue
-python3 scripts/sync_catalogs.py counts
+python3 -m lab.server --catalog-only --port 8787
 ```
 
-Syncs retain raw public downloads with SHA-256 provenance. To restore offline snapshots to a fresh DB, use `neuronary-files data/sources/neuronary` and `personas-file data/sources/neuronpersonas/library.json`. Runtime DB, source dumps, model weights and credentials are excluded from Git. Keep the local data folder or resynchronize it on a new machine.
+Open **http://127.0.0.1:8787**. The existing workspace already has its database; do not resynchronize while workers are running. Metadata-only refreshes preserve results; changed interventions archive prior evidence and require fresh validation. Running jobs block intervention changes.
 
-## Rent and run below US$2/hour
-
-The helper `scripts/vast_gpu.py` reads `VAST_AI_API_KEY` from the environment, lists verified 96 GB RTX PRO 6000 offers, rechecks availability, and rejects a conservative compute-plus-storage estimate above US$2/hour. It never prints generated API keys. Load your key privately in Terminal; do not commit it or pass it as a shell argument.
+To restore saved public snapshots offline, replace the two download commands with:
 
 ```bash
-python3 scripts/vast_gpu.py offers
-python3 scripts/vast_gpu.py rent OFFER_ID --key ~/.ssh/id_ed25519.pub
-python3 scripts/vast_gpu.py status
+python3 scripts/sync_catalogs.py neuronary-files data/sources/neuronary
+python3 scripts/sync_catalogs.py personas-file data/sources/neuronpersonas/library.json
 ```
 
-Record the returned instance ID, SSH host and port. Offers change quickly. The helper uses 180 GB disk and an official PyTorch CUDA 13 image; the image and model compatibility must be verified on the rented host. It does not impose a total dollar spending cap. Destroy the rental when done; a stopped instance can still incur storage charges.
-
-Upload this folder (no token files or local environment) using SSH:
+The real Qwen3-8B atlas is a separate public asset:
 
 ```bash
-tar --exclude=.venv --exclude=.git --exclude=.env --exclude=__pycache__ -czf /tmp/persona-lab.tar.gz .
+curl -fsS https://neuronpersonas.com/data/qwen/atlas.json \
+  -o data/sources/neuronpersonas/atlas.json
+```
+
+## Rent, install and launch
+
+Keep the Vast key in an existing private env file. The helper reads only `VAST_AI_API_KEY`; it never executes the file or prints credentials.
+
+```bash
+python3 scripts/vast_gpu.py offers --env-file /private/path/credentials.env
+python3 scripts/vast_gpu.py rent OFFER_ID --key ~/.ssh/id_ed25519.pub \
+  --env-file /private/path/credentials.env
+python3 scripts/vast_gpu.py status --env-file /private/path/credentials.env
+```
+
+Renting rechecks availability and rejects a conservative compute-plus-storage estimate above US$2/hour. This is an hourly cap, not a total budget. The helper requests a CUDA 13 PyTorch image and 180 GB disk. Keep provider credentials on the Mac. Transfer the source and catalog through SSH:
+
+```bash
+tar --exclude='.git' --exclude='.venv' --exclude='.state' \
+  --exclude='.env*' --exclude='outputs' \
+  -czf /tmp/persona-lab.tar.gz .
 scp -P SSH_PORT /tmp/persona-lab.tar.gz root@SSH_HOST:/tmp/
-ssh -p SSH_PORT root@SSH_HOST
-mkdir -p /workspace/persona-lab
+ssh -p SSH_PORT root@SSH_HOST \
+  'mkdir -p /workspace/persona-lab && tar -xzf /tmp/persona-lab.tar.gz -C /workspace/persona-lab'
+```
+
+On the GPU:
+
+```bash
 cd /workspace/persona-lab
-tar -xzf /tmp/persona-lab.tar.gz
+bash scripts/fetch_upstream.sh
 bash scripts/bootstrap_gpu.sh
 ```
 
-This installs dependencies, captures GPU/CUDA/PyTorch/disk information, runs tests and downloads official model weights through real smoke inference. It loads one model at a time, in BF16 on CUDA. It records actual memory peaks in smoke reports. The 27B model needs substantially more VRAM than the small models. All three official models are allowlisted: `Qwen/Qwen3.5-4B`, `Qwen/Qwen3-8B`, `Qwen/Qwen3.8-27B`. Remote custom model code is disabled.
+Bootstrap reuses a working CUDA-image PyTorch, verifies a real BF16 GPU operation, installs dependencies, records versions and disk/GPU data, runs tests and writes resumable smoke reports. Use `SKIP_SMOKE=1` for installation only. Optional optimized kernel/compiler commands are documented in [kernel setup](docs/kernel_setup.md); the reference path remains available.
 
-On the GPU, start separate processes:
+Start the local-only servers on the GPU:
 
 ```bash
-.venv/bin/python -m lab.worker --model Qwen/Qwen3.5-4B --poll
 .venv/bin/python -m lab.server --port 8787
+# In another terminal:
 .venv/bin/python scripts/explorer_safe.py
 ```
 
-Run the 8B and 27B worker/model tests sequentially to avoid loading multiple models into VRAM. The queue can be interrupted and resumed; expired leases are reclaimable and failures remain recorded. Failed jobs can be explicitly reset through `Catalog.retry_failed()`. A failed model dependency stops that worker early while preserving the remaining pending jobs. Use one GPU inference process at a time; the explorer and lab have independent runtimes, so close one before starting live inference in the other.
-
-On the Mac, forward both loopback ports:
+On the Mac, use the existing verified SSH host key:
 
 ```bash
-ssh -N -o ExitOnForwardFailure=yes -p SSH_PORT \
-  -L 127.0.0.1:8787:127.0.0.1:8787 \
-  -L 127.0.0.1:8791:127.0.0.1:8791 root@SSH_HOST
+bash scripts/tunnel.sh SSH_HOST SSH_PORT .state/known_hosts
 ```
 
-Open http://127.0.0.1:8787 and http://127.0.0.1:8791. No HTTP port needs to be published on Vast. Review and verify the SSH host fingerprint through your provider's console. Do not copy Vast account credentials to the GPU; public Qwen downloads usually require no Hugging Face token. If authentication is needed, use a short-lived read-only HF token.
+Open **http://127.0.0.1:8787** for the lab and **http://127.0.0.1:8791** for the original explorer. The helper reconnects, keeps both forwards on loopback and stops its own child on Ctrl+C. See [tunnel instructions](docs/tunnel.md) for the current direct-host key alias and occupied-port handling. No public HTTP port is needed.
 
-Before destroying, copy the database and outputs back. Stop writers first or use SQLite's backup API for a consistent database snapshot. Then:
+The original Qwen3.5 3D source and model-specific caches are preserved under `vendor/neuron-explorer`. Always launch through the safe wrapper: agent execution routes are disabled with HTTP 403. The Qwen3-8B atlas displays **36 × 12,288** actual indexed neurons with signed published categories in 2D; it is not a 3D embedding. Qwen3.8 has no fabricated coordinates.
+
+## Validation, reviews and resumption
 
 ```bash
-python3 scripts/vast_gpu.py destroy INSTANCE_ID
+bash scripts/run_validation.sh
 ```
 
-## Steering and validation
+The batch script processes starter and Neuronary recipes before a default **80-job Persona Library sample**, using four standardized prompts, two greedy repeats and a 96-token generation cap. `MAX_NEW_TOKENS` and `PERSONA_JOBS` adjust these explicit limits. Rerunning resumes pending work; completed jobs are not repeated. Lease renewal and recorded failures support interruption/OOM recovery. Failed jobs require deliberate retry through `Catalog.retry_failed()`.
 
-Additive steering is applied to the MLP `down_proj` input on the selected layer:
+Use one GPU inference process at a time. The worker, UI and original explorer have separate runtimes; stop worker inference before a live-chat demonstration. Ordinary comparisons generate fresh baselines; validation may reuse a matching real baseline with recorded cache provenance.
 
-`activation[n] += dose * residual_median[layer] / norm(W_down[:, n])`
+Neuronary uses model-bound published residual norms or exact fixed calibration. Persona Library uses unsteered prompt residual norms. **Twelve starter Qwen3-8B rows explicitly request fixed normalization despite originating in the prompt-normalized library.** Those declarations are preserved, so their results are not exact replications of the website's procedure. Unsupported models, experts, methods and normalizations fail explicitly.
 
-Neuronary uses its model-specific published norm tables, falling back to measurement on its exact fixed calibration text. Persona Library instead measures median residual norms on the unsteered chat prompt, excluding the first token. Multiplicative recipes retain their own semantics. Expert/MoE and conditional recipes are rejected rather than approximated. Hook cleanup runs after success, failure and OOM. Multi-neuron combinations keep signed components intact. Different architectures have separate bounds and shape checks.
+Changed text alone never counts as reproduction. Codex rubric reviews and the optional unsteered Qwen judge are labeled exploratory agent assessments, not independent human or scientific validation. Greedy-repeat consistency is not sampling robustness. See [validation methods](docs/validation_methods.md) and the evidence-backed `docs/demo_findings_*.md` reviews.
 
-Validation uses four standardized prompts, two deterministic repetitions, baseline comparisons, output differences, token counts, consistency and GPU memory telemetry. Greedy decoding means changing a seed is not a stochastic robustness test. Coherence, persona fidelity and accuracy require human review and are left unevaluated. Changed output alone never marks a recipe reproduced. This is causal experimentation, not evidence that a neuron has a single stable meaning.
-
-Run checks:
+Export a consistent snapshot while workers run:
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 scripts/smoke_models.py --output outputs/smoke-models.json
+.venv/bin/python scripts/export_results.py --db data/lab.sqlite3 \
+  --output outputs/results.jsonl --report outputs/result-report.json \
+  --backup outputs/lab-backup.sqlite3
 ```
 
-The original Qwen3.5 3D explorer and its model-specific caches are preserved under `vendor/neuron-explorer`. Its optional agent HTTP routes are disabled by `scripts/explorer_safe.py`, preventing the agent shell features from being used. Launch through this wrapper, not upstream `server.py`. The original explorer's own model config loading requires Hugging Face access even for cached visualization. Qwen3-8B includes the downloaded source atlas: 36 × 12,288 indexed neurons, positive/negative published category colors, exact neuron hover and catalog search. It is a 2D index map; no full 3D embedding is supplied. Qwen3.8 has no fabricated atlas. Layer maps are explicitly index layouts, not neuron embeddings or biological locations.
+Copy these artifacts back to the Mac before stopping or destroying the rental. The report distinguishes recipe/job statuses, exact source/model counts, review verdicts and narrow arithmetic/coherence proxies. Do not copy a live SQLite main file alone; its WAL may contain committed results.
 
-## Current limitations and honest acceptance status
+```bash
+python3 scripts/vast_gpu.py stop INSTANCE_ID --env-file /private/path/credentials.env
+python3 scripts/vast_gpu.py start INSTANCE_ID --env-file /private/path/credentials.env
+python3 scripts/vast_gpu.py destroy INSTANCE_ID --env-file /private/path/credentials.env
+```
 
-See `docs/verification.md`. No GPU smoke tests, model downloads, local personality reproductions or browser rendering were verified in this restricted session. A brief Vast rental was destroyed after SSH proved unavailable. Git initialization/push was blocked by the session filesystem policy, so this folder is a prepared source tree rather than a committed Git repository. In an ordinary Terminal you can run `git init`, review `.gitignore`, commit, and optionally create a private GitHub repository. The upstream projects were downloaded from official GitHub main archives because Git network operations were unavailable.
+Stopped instances retain storage charges. Destroying removes the rented disk; preserve evidence first.
 
-## Why a small edit can change behavior
+## Why one edited neuron can change the voice
 
-Each MLP neuron writes a learned direction into the shared residual stream. That direction can bias concepts such as identity, style or refusal that later layers use when selecting tokens. Adding a dose normalized to the residual norm can be a substantial perturbation, even though only one index is edited. The effect repeats at every generation step, and each chosen token becomes context for the next, which can reinforce a new voice. The weights are unchanged: this is an inference-time intervention, not training. Effects can be distributed, entangled, prompt-dependent or incoherent; negative steering need not produce the opposite persona.
+Each MLP neuron writes a learned direction into the shared residual stream. Pushing that direction can bias identity, topic or style, repeatedly at every generation step; the resulting words then reinforce the new context. A normalized dose of one can move the residual by an entire typical residual norm, so a small number of edited indexes need not mean a small intervention. Weights remain unchanged: this is temporary inference steering, not training. Features are entangled and prompt-dependent; strong doses can produce neighboring identities, factual errors or repetition.
 
-Sources: [Neuronary method and runner](https://github.com/lyramakesmusic/neuronary), [original neuron explorer](https://github.com/lyramakesmusic/neuron-explorer), [Persona Library method and atlas](https://neuronpersonas.com/).
+Sources: [Neuronary](https://github.com/lyramakesmusic/neuronary), [neuron explorer](https://github.com/lyramakesmusic/neuron-explorer), [Persona Library](https://neuronpersonas.com/).
