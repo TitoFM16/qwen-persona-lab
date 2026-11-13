@@ -2427,6 +2427,10 @@
   "interpretation_notes": [
     "POST /api/personas created five persistent custom recipes and POST /api/compare recorded15comparisons; no direct DB edits were performed.",
     "math_answers_323 is a literal323presence indicator, not an accuracy verdict. False means not observed in the64token output and may reflect truncation; it must not be counted as mathematically wrong.",
-    "Five saved configurations are exploratory curated variants. Several outputs do not clearly express the named target; changed text alone does not establish persona reproduction."
+    "Five saved configurations are exploratory curated variants. Several outputs do not clearly express the named target; changed text alone does not establish persona reproduction.",
+    "Second exploration (today-hilarious-q27-personas) added two new custom recipes: Chief Development Officer (Jiangsu Tourism) and Void Predator (dark office nihilist).",
+    "Both use exact published 27B parent layer/neuron sets with preserved signed doses and supported normalization layer_residual_median_over_down_column_l2.",
+    "neuronary:ff9ya2ya (Yandere) uses gne_relative normalization which is not in supported NORMALIZATIONS; reported as unsupported, not silently converted.",
+    "Humor ratings are agent judgment, not objective human or independent research."
   ]
 }
