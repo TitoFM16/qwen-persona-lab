@@ -31,6 +31,19 @@ Environment: NVIDIA driver **615.71.09**, driver CUDA capability **13.4**, PyTor
 
 Older inference records retain their original null revision fields. The post-run immutable cache inventory in [`data/model-cache-manifest.json`](../data/model-cache-manifest.json) records exactly one snapshot per model, config hashes and weight metadata. No historical revision hash was invented; future loads are pinned to resolved revisions.
 
+### Current deployment note: simultaneous resident pool (2026-11-13, rental 60502794)
+
+The table above is historical, individual-model 32-token smoke data and is not relabeled here. Separately, on the live rental all three models were observed GPU-resident and GPU-ready at once (BF16, pinned revisions, no quantization substitution; `model_errors={}`), alongside the original 4B explorer runtime. Root validation (PASS, completed 2026-11-13T15:22:07Z; `outputs/today-resident-pool-validation.json`, `outputs/today-all-three-resident-root-proof.json`):
+
+| Observation | Value |
+|---|---|
+| NVIDIA total / used / available free | 97,887 / 86,831 / 10,419 MiB (~84.8 GiB used, ~10.2 GiB free) |
+| API torch allocated / peak / free | 80,191,505,408 / 80,248,871,424 / 10,925,047,808 B |
+| Requests (HTTP 200, 48 tokens, fresh inference) | 4B Cookie 2.03 s; 8B Flask 1.30 s; 27B Evil alternate 6.75 s; 4B Cookie 2.02 s wall |
+| Runtimes before and after each request | rt-1/rt-2/rt-3, load_count 1 each, unchanged, so no reload on switch |
+
+These are single snapshots and elapsed times for those requests, not guarantees for longer contexts or other prompts. Generation is serialized by one GPU lock; concurrent generation was not tested. Startup warm-up recorded 0.50 s (4B), 0.04 s (8B), 11.0 s (27B); initial load timings were not observed. The repeated 4B case matched deterministically. This verifies runtime residency and switching only, not persona fidelity. Local suite: 130 CPU/software tests pass (not GPU or scientific tests).
+
 ## Software, explorer and security
 
 **69 local software tests pass.** The last confirmed remote suite passed 60 tests. The later OOM regression and presentation-controller tests were verified locally; no additional GPU rental was made for those software tests. Tests cover numerical steering, native architecture/cache integration, source fidelity, SQLite recovery, review evidence, timestamp provenance, resource guards and safe failure handling. Python/JavaScript/shell checks passed.
@@ -47,4 +60,4 @@ Source is in the private repository [`TitoFM16/qwen-persona-lab`](https://github
 
 Twelve Qwen3-8B starter rows explicitly declare fixed normalization despite originating from a prompt-normalized library. Their CSV declarations were preserved, so these are not exact original-method replications. Unsupported models, normalizations, experts and conditional methods are rejected explicitly. The ZIP specification and supplied synchronization script were never provided; the 36-row starter CSV is present and imported.
 
-Primary rental **60435160** was approximately **US$1.433/hour**, below the US$2/hour cap. It was **destroyed**, and a subsequent provider listing returned **[]**, verified 2026-11-13T04:06:27.566579+00:00. No GPU is rented. The local receipt is `outputs/gpu-final/outputs/rental-destruction-receipt.json`; final evidence and a verified SQLite snapshot are in that same directory. The Mac UI at port 8787 now runs in catalog-only mode.
+Primary rental **60435160** was approximately **US$1.433/hour**, below the US$2/hour cap. It was **destroyed**, and a subsequent provider listing returned **[]**, verified 2026-11-13T04:06:27.566579+00:00. At that historical snapshot no GPU remained rented. The local receipt is `outputs/gpu-final/outputs/rental-destruction-receipt.json`; final evidence and a verified SQLite snapshot are in that same directory. At that time the Mac UI at port 8787 ran in catalog-only mode; see the current deployment note above for today's active presentation rental.

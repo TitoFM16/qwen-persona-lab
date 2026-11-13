@@ -8,13 +8,24 @@ The live session is scheduled to end at **4:00 p.m. Bogotá today, November 13 (
 |---|---|
 | Live presentation rental | **READY** |
 | Main UI and original Qwen3.5 3D explorer | Reachable on this Mac through local-only forwards (below) |
-| **Qwen3.5-4B** and **Qwen3-8B** | **Available now** on the current rental for chat and optional comparison |
-| **Qwen3.8-27B** | **Still downloading.** Not ready; do not present it as available. Verification is pending |
+| **Qwen3.5-4B, Qwen3-8B, Qwen3.8-27B** | **All three GPU-resident and GPU-ready** on rental 60502794 for chat and optional comparison (`model_errors={}`) |
+| Persona-quality evidence | Not scientifically validated here; this is a runtime-readiness status only |
 | Deadline protection | Local controller enforces the deadline, and an **independent GPU-side deletion timer is armed** (instance-scoped credential; no full account key on the GPU) |
 
-**Start with Cookie Monster on Qwen3.5-4B.** A per-model cache guard keeps an uncached selected model from starting a competing download or blocking the ready 4B. Qwen3.8-27B enables automatically once its full pinned cache is ready. If a model is loading or unready, the reason is shown beside the chat. This differs from the earlier all-three-model smoke evidence, which came from a destroyed rental.
+**Start with Cookie Monster on Qwen3.5-4B.** A per-model cache guard keeps an uncached selected model from starting a competing download or blocking the ready 4B. If a model is ever loading or unready, the reason is shown beside the chat (relevant to future rental startups, where caching and GPU warm-up are separate stages). The earlier all-three-model smoke evidence came from a destroyed rental and is historical.
 
-The resident model pool is deployed (`QWEN_RESIDENT_MODELS=1`). Three models are supported, but **only two are GPU-resident now: Qwen3.5-4B and Qwen3-8B**, each in its own retained runtime. Changing between these ready models does not unload or reload weights; changing personas on one model only changes temporary steering hooks. Qwen3.8-27B should warm automatically once its full cache finishes; three-model fit is not yet measured (pending). Generation and warm-up share one GPU lock, so requests queue rather than run in parallel, which is fine for one presenter. A startup thread warms fully cached models with a tiny unsteered generation (no download, no experiment record); the first prompt of a new shape may still be slower. The UI shows download/cache waiting, GPU warming and GPU ready; a not-ready model is disabled. BF16 is unchanged. The original 3D explorer has a separate 4B runtime. The earlier per-model smoke table is not simultaneous-memory evidence.
+The resident model pool is deployed (`QWEN_RESIDENT_MODELS=1`). **All three models are GPU-resident and warm now**, each in its own retained runtime (`rt-1`/`rt-2`/`rt-3`, load_count 1 each, BF16 pinned revisions, no quantization substitution), next to the original separate 4B explorer runtime. Switching reuses retained weights and kernel warm-up (no unload/reload per selection); changing personas on one model only changes temporary steering hooks. This does not guarantee zero latency or zero new kernel compilation for every prompt shape.
+
+Observed on 2026-11-13 (snapshots and per-request timings, not guarantees):
+
+| Measure | Observed |
+|---|---|
+| NVIDIA device memory | 97,887 MiB total; 86,831 MiB used (~84.8 GiB); 10,419 MiB (~10.2 GiB) available free (not total minus used) |
+| API torch allocated / device free | torch allocated: 80,191,505,408 B (process tensor allocation); device free: 10,925,047,808 B (whole-device available free memory from `cuda.mem_get_info`, not process-free) |
+| Switch test (HTTP 200, 48 tokens, wall time) | 4B Cookie 2.03 s → 8B Flask 1.30 s → 27B Evil alternate 6.75 s → 4B Cookie 2.02 s |
+| Runtime IDs / load counts before vs after | Identical across all four requests (rt-1/2/3, 1 each): no reload observed |
+
+Generation and warm-up share one GPU lock, so requests queue rather than run in parallel, which is fine for one presenter. A startup thread warms fully cached models with a tiny unsteered generation (no download, no experiment record); the first prompt of a new shape may still be slower. The UI shows download/cache waiting, GPU warming and GPU ready; a not-ready model is disabled. BF16 is unchanged. The original 3D explorer has a separate 4B runtime. The earlier per-model smoke table is not simultaneous-memory evidence.
 
 Fresh local 4B tests of Cookie Monster, OG Evil Qwen and a saved custom recipe all returned successfully. These are observations, not guarantees: the first cold comparison took about 25 seconds and later small-model comparisons about 2 seconds.
 
@@ -42,7 +53,7 @@ Setup and download progress is in `outputs/live-demo-controller.log` and `output
    - **Optional comparison:** open the collapsed **comparison** section for prompt, seed, tokens, **Run comparison**, side-by-side latest outputs and metrics.
    - **Advanced editing:** the neuron editor, normalization, add/remove/reset, raw source and **Save personal variant** are in the collapsed **advanced** section (see "Save a persona of your own").
 5. For the 4B hostile example, search **OG Evil Qwen** and ask the colleague-disagreement prompt. Its behavior is prompt-dependent: a fresh test of its plain identity introduction was ordinary, so do not promise robust evil behavior. Compare rather than assuming the label manifests.
-6. Qwen3-8B is GPU-ready now and stays resident alongside 4B, so switching to it does not reload weights (requests still queue behind any running generation). Larger-model contrast (**Evil Qwen (alternate)** on **Qwen3.8-27B**) only works **after that model shows ready**; until then, use 4B or 8B. Earlier stored results for the alternate recipe showed hostile tone across four tested prompts on a previous rental, which does not certify helpfulness or factual reliability.
+6. Qwen3-8B and Qwen3.8-27B are GPU-ready and stay resident alongside 4B, so switching does not reload weights (requests still queue behind any running generation; 27B replies are slower, about 6.7 s for 48 tokens in the test). Larger-model contrast: **Evil Qwen (alternate)** on **Qwen3.8-27B**. Earlier stored results for the alternate recipe showed hostile tone across four tested prompts on a previous rental, which does not certify helpfulness or factual reliability.
 
 Use the existing **Experiment history** tab for recorded comparisons if a live response is slow. Agent-reviewed reproduction labels refer to exploratory model-assisted rubrics, not independent human validation. No automatic validation batch or judge is started by browsing, chatting or opening the catalog.
 
