@@ -159,8 +159,10 @@ class ModelRuntime:
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
         loader = AutoModelForImageTextToText if getattr(config, 'vision_config', None) else AutoModelForCausalLM
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False)
+        # Direct placement avoids retaining an entire 27B CPU copy while transferring
+        # weights to the GPU. Accelerate is a declared runtime dependency.
         model = loader.from_pretrained(model_id, dtype=dtype, trust_remote_code=False,
-                                       attn_implementation='eager').to(self.device).eval()
+                                       attn_implementation='eager', device_map={'': self.device}).eval()
         layers = decoder_layers(model)
         if len(layers) != MODELS[model_id]['layers']:
             raise ValueError('Downloaded model layer count differs from registered architecture')
@@ -192,7 +194,7 @@ class ModelRuntime:
                     seen[layer] = float(h[0, 1:].float().norm(dim=-1).median())
                 handles.append(layers[layer].register_forward_hook(capture))
             with self.torch.inference_mode():
-                self.model(input_ids=ids, use_cache=False)
+                self.model(input_ids=ids, use_cache=False, logits_to_keep=1)
         finally:
             for handle in handles:
                 handle.remove()
@@ -243,7 +245,7 @@ class ModelRuntime:
         if intervention:
             intervention.phase = 'prefill'
         with torch.inference_mode():
-            out = self.model(input_ids=ids, use_cache=True)
+            out = self.model(input_ids=ids, use_cache=True, logits_to_keep=1)
             for step in range(max_new):
                 token = out.logits[:, -1].float().argmax(-1)
                 value = int(token[0])
@@ -255,7 +257,7 @@ class ModelRuntime:
                     if intervention:
                         intervention.phase = 'decode'
                     out = self.model(input_ids=token.reshape(1, 1), past_key_values=out.past_key_values,
-                                     use_cache=True)
+                                     use_cache=True, logits_to_keep=1)
         return self.tokenizer.decode(tokens, skip_special_tokens=True).strip(), finish, tokens
 
     def compare(self, model_id, prompt, components, normalization='neuronary', method=None,
@@ -266,8 +268,13 @@ class ModelRuntime:
         if normalization not in NORMALIZATIONS:
             raise ValueError('Unsupported normalization; refusing silent fallback')
         op, scope = method.get('op', 'add'), method.get('apply_to', 'all_tokens')
+        site = method.get('site', 'mlp.down_proj.input')
         if op not in {'add', 'mul'} or scope not in {'all_tokens', 'prompt_tokens', 'generated_tokens'}:
             raise ValueError('Unsupported method')
+        if site not in {'mlp.down_proj.input', 'residual_stream_after_layer'}:
+            raise ValueError('Unsupported intervention site')
+        if site == 'residual_stream_after_layer' and op != 'add':
+            raise ValueError('Residual-stream multiplication is not equivalent to MLP neuron multiplication')
         if not isinstance(max_new_tokens, int) or not 1 <= max_new_tokens <= 1024:
             raise ValueError('max_new_tokens must be between 1 and 1024')
         with self._lock:
@@ -301,7 +308,11 @@ class ModelRuntime:
                     'model': model_id, 'revision': getattr(self.model.config, '_commit_hash', None),
                     'components': components, 'normalization': normalization, 'norm_source': norm_source,
                     'residual_medians': medians, 'activation_units': {f'L{l}N{n}': u for (l,n),u in units.items()},
-                    'method': {'op': op, 'apply_to': scope}, 'seed': seed, 'decoding': 'greedy',
+                    'method': {'op': op, 'apply_to': scope, 'site': site}, 'seed': seed, 'decoding': 'greedy',
+                    'implemented_site': 'mlp.down_proj.input',
+                    'site_equivalence': ('Linear down projection followed by residual addition makes the additive '
+                                         'down-input hook equivalent to adding its normalized output column after '
+                                         'these registered Qwen decoder layers.' if site == 'residual_stream_after_layer' else None),
                     'batch_size': 1, 'thinking': False, 'max_new_tokens': max_new_tokens,
                     'baseline_prompt_tokens': baseline_ids.shape[-1], 'steered_prompt_tokens': ids.shape[-1],
                     'independent_chat_histories': baseline_messages is not None or steered_messages is not None,

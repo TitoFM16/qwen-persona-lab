@@ -119,12 +119,13 @@ class Catalog:
 
     def get_recipe(self,id): return self._recipe(self.db.execute('SELECT * FROM recipes WHERE id=?',(id,)).fetchone())
 
-    def list_recipes(self,query='',model=None,status=None,limit=50,offset=0,layer=None,neuron=None):
+    def list_recipes(self,query='',model=None,status=None,limit=50,offset=0,layer=None,neuron=None,source=None):
         clauses=[];args=[]
         if query:
             clauses.append('(name LIKE ? OR description LIKE ? OR raw_json LIKE ?)');args += ['%'+query+'%']*3
         if model: clauses.append('model=?');args.append(model)
         if status: clauses.append('status=?');args.append(status)
+        if source: clauses.append('source=?');args.append(source)
         components=[]
         if layer is not None: components.append("json_extract(n.value,'$.layer')=?");args.append(int(layer))
         if neuron is not None: components.append("json_extract(n.value,'$.neuron')=?");args.append(int(neuron))
@@ -152,12 +153,13 @@ class Catalog:
                     self.db.execute('INSERT OR IGNORE INTO jobs(recipe_id,prompt,seed,created_at,updated_at) VALUES (?,?,?,?,?)',(rid,prompt,seed,now,now))
         added=self.db.total_changes-before;self.db.commit();return added
 
-    def claim_job(self,worker='worker',lease_seconds=600,model=None):
+    def claim_job(self,worker='worker',lease_seconds=600,model=None,source=None):
         now=time.time();self.db.execute('BEGIN IMMEDIATE')
         try:
             sql="SELECT j.* FROM jobs j JOIN recipes r ON r.id=j.recipe_id WHERE (j.status='pending' OR (j.status='running' AND j.lease_until<?))"
             args=[now]
             if model: sql+=' AND r.model=?';args.append(model)
+            if source: sql+=' AND r.source=?';args.append(source)
             row=self.db.execute(sql+' ORDER BY j.id LIMIT 1',args).fetchone()
             if not row: self.db.commit();return None
             self.db.execute("UPDATE jobs SET status='running',attempts=attempts+1,worker=?,lease_until=?,updated_at=? WHERE id=?",(worker,now+lease_seconds,now,row['id']))
@@ -195,7 +197,8 @@ class Catalog:
         self.db.commit();return n
 
     def list_jobs(self,limit=100):
-        rows=[dict(r) for r in self.db.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT ?',(limit,))]
+        # Work already started should stay visible even with a much larger pending catalog.
+        rows=[dict(r) for r in self.db.execute("SELECT * FROM jobs WHERE status!='pending' ORDER BY updated_at DESC,id DESC LIMIT ?",(limit,))]
         for r in rows:
             if r['result_json']:r['result']=json.loads(r['result_json'])
         return rows

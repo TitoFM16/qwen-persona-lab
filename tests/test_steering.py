@@ -80,8 +80,49 @@ class ValidationTests(unittest.TestCase):
             runtime.compare('Qwen/Qwen3-8B', 'Who are you?', [], normalization='guessed')
         self.assertFalse(runtime.status['loaded'])
 
+    def test_unsupported_site_and_residual_multiplication_fail_before_loading(self):
+        runtime = ModelRuntime()
+        for method in [{'site': 'attention.output'},
+                       {'site': 'residual_stream_after_layer', 'op': 'mul'}]:
+            with self.assertRaises(ValueError):
+                runtime.compare('Qwen/Qwen3-8B', 'Who are you?', [], method=method)
+        self.assertFalse(runtime.status['loaded'])
+
 
 class WorkerTests(unittest.TestCase):
+    def test_source_filter_and_persisted_worker_telemetry(self):
+        import tempfile
+        import json
+        from unittest.mock import patch
+        from pathlib import Path
+        from lab.catalog import Catalog
+        from lab.worker import run
+        class Runtime:
+            def __init__(self, **kwargs): pass
+            @property
+            def status(self): return {'gpu': {'name': 'test-only GPU'}, 'loaded': False}
+            def compare(self, *args, **kwargs):
+                return {'baseline': 'base', 'steered': 'out', 'metrics': {}, 'provenance': {}}
+            def unload(self): pass
+        with tempfile.TemporaryDirectory() as temp:
+            db = str(Path(temp) / 'test.sqlite3')
+            status = Path(temp) / 'worker.json'
+            catalog = Catalog(db)
+            recipe = {'model': 'Qwen/Qwen3-8B', 'name': 'test', 'neurons': [{'layer': 1, 'neuron': 2, 'dose': 1}]}
+            persona = catalog.upsert(recipe, 'neuronpersonas')
+            starter = catalog.upsert(recipe, 'starter')
+            catalog.enqueue([persona, starter], prompts=['Who are you?'], repeats=1)
+            with patch('lab.worker.ModelRuntime', Runtime):
+                result = run(db, source='starter', status_file=str(status))
+            self.assertEqual(result['completed_jobs'], 1)
+            self.assertEqual(catalog.counts()['jobs']['pending'], 1)
+            self.assertEqual(catalog.get_recipe(persona)['status'], 'pending')
+            self.assertEqual(catalog.get_recipe(starter)['status'], 'completed')
+            snapshot = json.loads(status.read_text())
+            self.assertEqual(snapshot['state'], 'stopped')
+            self.assertEqual(snapshot['completed_jobs'], 1)
+            self.assertEqual(snapshot['gpu']['name'], 'test-only GPU')
+            catalog.close()
     def test_resume_only_pending_and_record_consistency(self):
         import tempfile
         from unittest.mock import patch
@@ -145,6 +186,49 @@ except ImportError:
 
 @unittest.skipIf(torch is None, 'PyTorch required for numeric hook integration tests; run on GPU installation')
 class NumericTests(unittest.TestCase):
+    def test_native_qwen_cached_decode_calibration_and_hook_cleanup(self):
+        # Random tiny native architectures validate API/hook/cache compatibility;
+        # they are not pretrained model smoke tests or persona reproductions.
+        try:
+            from transformers import Qwen3Config, Qwen3ForCausalLM, Qwen3_5Config, Qwen3_5ForConditionalGeneration
+        except ImportError:
+            self.skipTest('Transformers with native Qwen3.5 support required')
+        class Tokenizer:
+            eos_token_id = 63
+            def decode(self, ids, **kwargs): return ' '.join(map(str, ids))
+        configs = [
+            (Qwen3ForCausalLM, Qwen3Config(vocab_size=64, hidden_size=32, intermediate_size=64,
+                num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=8)),
+            (Qwen3_5ForConditionalGeneration, Qwen3_5Config(text_config={
+                'vocab_size': 64, 'hidden_size': 32, 'intermediate_size': 64, 'num_hidden_layers': 2,
+                'num_attention_heads': 4, 'num_key_value_heads': 2, 'head_dim': 8,
+                'layer_types': ['linear_attention', 'full_attention'],
+                'linear_num_value_heads': 4, 'linear_num_key_heads': 4,
+                'linear_key_head_dim': 8, 'linear_value_head_dim': 8},
+                vision_config={'depth': 1, 'hidden_size': 32, 'intermediate_size': 64,
+                               'num_heads': 4, 'out_hidden_size': 32})),
+        ]
+        for loader, config in configs:
+            with self.subTest(architecture=loader.__name__):
+                torch.manual_seed(0)
+                model = loader(config).eval()
+                model.generation_config.eos_token_id = 63
+                runtime = ModelRuntime(device='cpu')
+                runtime.model, runtime.torch, runtime.tokenizer = model, torch, Tokenizer()
+                ids = torch.tensor([[1, 2, 3, 4]])
+                medians = runtime._measure(ids, {0, 1})
+                self.assertEqual(set(medians), {0, 1})
+                self.assertTrue(all(value > 0 for value in medians.values()))
+                baseline = runtime._generate(ids, 3)
+                layers = decoder_layers(model)
+                components = [{'layer': 0, 'neuron': 3, 'dose': .05}]
+                with Intervention(layers, components, {(0, 3): 1}) as hook:
+                    shifted = runtime._generate(ids, 3, hook)
+                self.assertLessEqual(len(shifted[2]), 3)
+                self.assertEqual(runtime._generate(ids, 3), baseline)
+                self.assertFalse(layers[0].mlp.down_proj._forward_pre_hooks)
+                self.assertFalse(layers[0]._forward_hooks)
+
     def test_normalized_single_and_multi_direction(self):
         # A residual change has exactly dose * residual_median magnitude for one neuron.
         projection = torch.nn.Linear(3, 2, bias=False)

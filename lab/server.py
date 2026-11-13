@@ -4,6 +4,7 @@ import argparse
 import json
 import mimetypes
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -29,6 +30,12 @@ class Application:
             self._catalog_local.catalog = Catalog(self.db_path)
         return self._catalog_local.catalog
 
+    def close_catalog(self):
+        catalog = getattr(self._catalog_local, 'catalog', None)
+        if catalog is not None:
+            catalog.close()
+            del self._catalog_local.catalog
+
     def runtime(self):
         with self._runtime_lock:
             if self._runtime is None:
@@ -44,7 +51,15 @@ class Application:
                 runtime = status() if callable(status) else status
             except Exception as exc:
                 runtime = {'loaded': False, 'error': str(exc), 'device': self.device}
-        return {'counts': self.catalog.stats(), 'runtime': runtime, 'models': MODELS,
+        worker = None
+        telemetry_path = ROOT.parent.parent / '.state/worker-status.json'
+        if telemetry_path.is_file():
+            try:
+                worker = json.loads(telemetry_path.read_text())
+                worker['stale'] = time.time() - float(worker.get('updated_at', 0)) > 45
+            except (OSError, ValueError, TypeError):
+                worker = {'state': 'unavailable', 'stale': True}
+        return {'counts': self.catalog.stats(), 'runtime': runtime, 'worker': worker, 'models': MODELS,
                 'atlas': {'Qwen/Qwen3.5-4B': {'available': False, 'assets_present': (ROOT.parent.parent / 'vendor/neuron-explorer/explorer/cache').exists(), 'reason': 'Original upstream 3D source and assets are preserved under vendor/neuron-explorer. Launch its local server separately using the documented safe launcher, then forward port 8791.'},
                           'Qwen/Qwen3-8B': {'available': (ROOT.parent.parent / 'data/sources/neuronpersonas/atlas.json').is_file(), 'reason': 'Published model-specific 2D neuron atlas imported from neuronpersonas.com. This is an indexed category atlas, not a 3D embedding.'},
                           'Qwen/Qwen3.8-27B': {'available': False, 'reason': 'No verified model-specific visualization data. Steering support must be validated on GPU.'}}}
@@ -59,7 +74,7 @@ class Application:
         if path == '/api/recipes':
             limit = min(100, max(1, int(one('limit',50))))
             offset = max(0,int(one('offset',0)))
-            return {'recipes': self.catalog.list_recipes(query=one('q',''), model=one('model'), status=one('status'), limit=limit, offset=offset, layer=int(one('layer')) if one('layer') is not None else None, neuron=int(one('neuron')) if one('neuron') is not None else None)}
+            return {'recipes': self.catalog.list_recipes(query=one('q',''), model=one('model'), status=one('status'), source=one('source'), limit=limit, offset=offset, layer=int(one('layer')) if one('layer') is not None else None, neuron=int(one('neuron')) if one('neuron') is not None else None)}
         if path.startswith('/api/recipes/'):
             recipe = self.catalog.get_recipe(path.rsplit('/',1)[1])
             if recipe is None: raise LookupError('Recipe not found')
@@ -100,6 +115,11 @@ class Application:
 
 def handler(app):
     class Handler(BaseHTTPRequestHandler):
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                app.close_catalog()
         def log_message(self, fmt, *args):
             # Avoid logging request bodies, prompts, recipes, and credentials.
             pass

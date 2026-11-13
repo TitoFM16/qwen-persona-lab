@@ -14,6 +14,7 @@ class ServerTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.app=Application(str(Path(self.temp.name)/'lab.sqlite3'))
+        self.addCleanup(self.app.close_catalog)
         self.app.post('/api/import',{'csv':'name,model,recipe\nTest,Qwen/Qwen3-8B,L8N100+0.5\n'})
         self.recipe=self.app.get('/api/recipes',{})['recipes'][0]
 
@@ -30,11 +31,17 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.app.get('/api/recipes',{'layer':['8'],'neuron':['100']})['recipes'][0]['id'],self.recipe['id'])
         self.assertFalse(self.app.get('/api/recipes',{'layer':['9']})['recipes'])
         self.assertEqual(self.app.post('/api/queue',{'recipe_ids':[self.recipe['id']]})['queued'],8)
-        self.assertTrue(self.app.get('/api/history',{})['jobs'])
+        self.assertFalse(self.app.get('/api/history',{})['jobs'])
+        job=self.app.catalog.claim_job()
+        self.app.catalog.complete_job(job['id'],{'baseline':'a','steered':'b'})
+        self.assertEqual(self.app.get('/api/history',{})['jobs'][0]['status'],'completed')
+        self.assertEqual(len(self.app.get('/api/recipes',{'source':['manual CSV']})['recipes']),1)
+        self.assertFalse(self.app.get('/api/recipes',{'source':['starter']})['recipes'])
         errors=[]
         def run():
             try: self.assertEqual(self.app.get('/api/status',{})['counts']['imported'],1)
             except Exception as exc: errors.append(exc)
+            finally: self.app.close_catalog()
         threads=[threading.Thread(target=run) for _ in range(3)]
         for t in threads:t.start()
         for t in threads:t.join()

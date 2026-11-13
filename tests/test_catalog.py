@@ -34,6 +34,16 @@ class CatalogTests(unittest.TestCase):
   self.assertEqual(self.c.list_recipes(layer=9,neuron=7),[])
   self.assertEqual(len(self.c.list_recipes(neuron=7)),1)
   self.assertEqual(self.c.list_recipes(model='Qwen/Qwen3.5-4B',layer=9,neuron=3),[])
+ def test_exact_source_filter(self):
+  self.c.upsert(self.recipe(),'starter');self.c.upsert(self.recipe(),'neuronary')
+  self.assertEqual(len(self.c.list_recipes(source='starter')),1)
+  self.assertEqual(self.c.list_recipes(source='starter')[0]['source'],'starter')
+  self.assertEqual(len(self.c.list_recipes()),2)
+ def test_history_prioritizes_actual_work_over_pending_catalog(self):
+  rid=self.c.upsert(self.recipe(),'starter');self.c.enqueue([rid],['First','Second','Third'],2)
+  job=self.c.claim_job();self.c.complete_job(job['id'],{'baseline':'a','steered':'b'})
+  history=self.c.list_jobs(limit=1)
+  self.assertEqual(history[0]['id'],job['id']);self.assertEqual(history[0]['status'],'completed')
  def test_invalid_not_silently_coerced(self):
   for value in ['L9N3', 'junk L9N3+1', [{'layer':1.1,'neuron':2,'dose':1}], [{'layer':1,'neuron':2,'dose':float('nan')}]]:
    with self.assertRaises(ValueError):parse_neurons(value)
