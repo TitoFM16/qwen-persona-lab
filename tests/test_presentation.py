@@ -1,7 +1,11 @@
 import argparse
 import datetime
+import fcntl
 import io
 import json
+import os
+import time
+from types import SimpleNamespace
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -11,7 +15,7 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
-from scripts.presentation import Presentation, PURPOSE, clean_environment, package_workspace, is_lab_backup, session_deadline, registered_public_key
+from scripts.presentation import Presentation, PURPOSE, clean_environment, package_workspace, is_lab_backup, session_deadline, registered_public_key, snapshot_ready, HandoffRejected, MODELS, main as presentation_main
 from scripts import vast_gpu
 
 
@@ -241,6 +245,263 @@ class PresentationTests(unittest.TestCase):
         try:con.execute('CREATE TABLE reviews (id INTEGER)');con.commit()
         finally:con.close()
         self.assertTrue(is_lab_backup(lab));self.assertFalse(is_lab_backup(judge))
+
+
+ID=60502794
+LABEL='persona-demo-abcdef123456'
+
+
+class ResumeFakeAPI(FakeAPI):
+    def __init__(self,**row):
+        super().__init__()
+        self.live=[dict({'id':ID,'label':LABEL,'actual_status':'running','ssh_host':'host','ssh_port':2222},**row)]
+
+
+class FakeRemote:
+    """Scripted ssh runner: dispatches on the stdin script and records every call."""
+    def __init__(self,deadline,ready=None,active=True,timer=None):
+        self.calls=[];self.active=active;self.ready=list(ready or [])
+        self.timer=timer or {'state':'armed','instance_id':ID,'deadline_unix':deadline,'pid':77}
+    def __call__(self,command,**kw):
+        script=kw.get('input') or ''
+        self.calls.append((command,kw,script))
+        if 'remote-deadline.json' in script:out=json.dumps(self.timer)
+        elif 'test -d /proc' in script:out='alive'
+        elif "python3 - <<'PY'" in script:
+            out=json.dumps(self.ready.pop(0) if len(self.ready)>1 else self.ready[0])
+        elif 'pgrep' in script:out='ACTIVE' if self.active else 'LAUNCHED'
+        else:out=''
+        return SimpleNamespace(stdout=out)
+    def scripts(self,needle):return [call[2] for call in self.calls if needle in call[2]]
+
+
+def ready_map(four=False):
+    return {model:(four and model==MODELS[0]) for model in MODELS}
+
+
+class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
+        self.deadline=time.time()+4*3600
+        (self.root/'.state').mkdir();(self.root/'known').write_text('host key')
+        self.state={'purpose':PURPOSE,'instance_id':ID,'label':LABEL,'phase':'deploying','controller_pid':41766,
+            'deadline_unix':self.deadline,'deadline_utc':self.iso(self.deadline),'ssh_host':'host','ssh_port':2222,
+            'known_hosts':str(self.root/'known')}
+        self.write_state()
+        self.args=argparse.Namespace(max_hourly=2,duration_hours=2,key='unused.pub',backup=None,
+            models=list(MODELS),fast_kernels=False,open_browser=False,expected_instance_id=ID,until=self.iso(self.deadline))
+        self.marker=self.root/'.state/presentation-handoff.json'
+        for name in ('lab/server.py','lab/static/app.js','lab/static/index.html','lab/static/style.css','scripts/start_services.sh'):
+            (self.root/name).parent.mkdir(parents=True,exist_ok=True);(self.root/name).write_text('x')
+    def tearDown(self):self.tmp.cleanup()
+    @staticmethod
+    def iso(value):return datetime.datetime.fromtimestamp(value,datetime.timezone.utc).isoformat()
+    def write_state(self):(self.root/'.state/presentation.json').write_text(json.dumps(self.state))
+    def state_bytes(self):return (self.root/'.state/presentation.json').read_bytes()
+    def controller(self,api=None,remote=None):
+        self.api=api or ResumeFakeAPI();self.remote=remote or FakeRemote(self.deadline,[ready_map()])
+        return Presentation(self.args,root=self.root,api=self.api,runner=self.remote,
+                            offer_provider=lambda:self.fail('must never rent'))
+    def assert_untouched(self):
+        self.assertTrue(self.api.live)
+        self.assertFalse([call for call in self.api.calls if call[2]=='DELETE' or '/asks/' in call[0]])
+    def reject(self,**controller_args):
+        c=self.controller(**controller_args);before=self.state_bytes()
+        with patch.object(c,'check_local_ports'),self.assertRaises(HandoffRejected):c.run(resume=True)
+        self.assertEqual(before,self.state_bytes());self.assertFalse(self.marker.exists())
+        self.assert_untouched()
+
+    def test_preflight_adopts_without_create_and_reads_timer_with_strict_ssh(self):
+        c=self.controller()
+        with patch.object(c,'check_local_ports'):timer=c.preflight()
+        self.assertEqual(timer['pid'],77);self.assert_untouched()
+        self.assertIn('StrictHostKeyChecking=yes',self.remote.calls[0][0])
+        self.assertEqual(self.remote.calls[0][0][-1],'bash -s')
+        self.assertFalse(self.marker.exists())
+
+    def test_wrong_provider_label_instance_or_status_rejected_without_destroy(self):
+        for row in [{'label':'persona-demo-other'},{'id':1},{'actual_status':'exited'},{'ssh_host':'elsewhere'}]:
+            with self.subTest(row=row):self.reject(api=ResumeFakeAPI(**row))
+
+    def test_wrong_timer_deadline_purpose_or_expected_id_rejected_without_destroy(self):
+        good={'state':'armed','instance_id':ID,'deadline_unix':self.deadline,'pid':77}
+        for timer in [dict(good,instance_id=5),dict(good,deadline_unix=self.deadline+3600),dict(good,state='failed')]:
+            with self.subTest(timer=timer):self.reject(remote=FakeRemote(self.deadline,[ready_map()],timer=timer))
+        self.args.until=self.iso(self.deadline+3600)
+        self.reject()
+        self.args.until=self.iso(self.deadline);self.args.expected_instance_id=5
+        self.reject()
+        self.args.expected_instance_id=ID;self.state['purpose']='other';self.write_state()
+        self.reject()
+        self.state.update(purpose=PURPOSE,deadline_unix=time.time()-1);self.write_state()
+        self.args.until=self.iso(self.state['deadline_unix'])
+        self.reject()
+
+    def test_marker_then_lock_gate_then_ownership_and_cleanup(self):
+        old=(self.root/'.state/presentation.lock').open('a');fcntl.flock(old,fcntl.LOCK_EX)
+        c=self.controller();events=[];before=self.state_bytes()
+        def sleeper(seconds):
+            events.append('sleep')
+            if len(events)==1:  # old controller still owns lock and rental
+                data=json.loads(self.marker.read_text())
+                self.assertEqual((data['phase'],data['old_pid'],data['new_pid'],data['instance_id']),
+                                 ('ready_for_takeover',41766,os.getpid(),ID))
+                self.assertEqual(data['validated_timer']['state'],'armed')
+                self.assertEqual(data['deadline_unix'],self.deadline)
+                self.assertEqual(before,self.state_bytes());self.assertFalse(c.owned);self.assert_untouched()
+            else:old.close()
+        def adopt():events.append('adopt');self.assertTrue(c.owned)
+        with patch.object(c,'check_local_ports'),patch.object(c,'adopt',side_effect=adopt), \
+             patch.object(c,'present'),patch.object(c,'backup_remote'),patch('scripts.presentation.time.sleep',sleeper):
+            c.run(resume=True)
+        self.assertEqual(events[:3],['sleep','sleep','adopt'])
+        self.assertEqual(json.loads(self.marker.read_text())['phase'],'taken_over')
+        self.assertFalse(self.api.live)  # owner's lifecycle cleanup destroys the rental at the end
+
+    def test_cancel_before_ownership_leaves_old_controller_and_rental(self):
+        old=(self.root/'.state/presentation.lock').open('a');fcntl.flock(old,fcntl.LOCK_EX)
+        c=self.controller();before=self.state_bytes()
+        with patch.object(c,'check_local_ports'),patch.object(c,'adopt') as adopt, \
+             patch('scripts.presentation.time.sleep',side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):c.run(resume=True)
+        adopt.assert_not_called();self.assert_untouched()
+        self.assertFalse(self.marker.exists());self.assertEqual(before,self.state_bytes())
+
+    def post_lock_failure(self,patcher):
+        c=self.controller();before=self.state_bytes()
+        with patch.object(c,'check_local_ports'),patch.object(c,'adopt') as adopt,patch.object(c,'present'), \
+             patch.object(c,'backup_remote') as backup,patcher(c):
+            with self.assertRaises(Exception):c.run(resume=True)
+        adopt.assert_not_called();backup.assert_not_called()
+        self.assertFalse(c.owned);self.assertEqual(before,self.state_bytes());self.assert_untouched()
+        self.assertFalse(self.marker.exists())
+        probe=(self.root/'.state/presentation.lock').open('a')
+        fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)  # lock was released after the failed adoption
+        probe.close()
+
+    def test_post_lock_timer_failure_never_deletes_or_changes_state(self):
+        seen=[]
+        def patcher(c):
+            real=c.preflight
+            def flaky(ports=True):
+                seen.append(ports)
+                if not ports:raise HandoffRejected('timer no longer armed')
+                return real(ports)
+            return patch.object(c,'preflight',side_effect=flaky)
+        self.post_lock_failure(patcher);self.assertEqual(seen,[True,False])
+
+    def test_state_commit_failure_never_deletes_or_changes_state(self):
+        def patcher(c):
+            def failing(path,state):
+                if Path(path)==c.state_path:raise OSError('disk full')
+            return patch('scripts.presentation.save_state',side_effect=failing)
+        self.post_lock_failure(patcher)
+
+    def test_scp_updates_follow_ownership_and_precede_trusted_start_services(self):
+        remote=FakeRemote(self.deadline,ready=[ready_map(four=True)],active=True);c=self.controller(remote=remote)
+        events=[];real=c.take_over
+        def take(timer):
+            real(timer);events.append(('owned',c.owned,json.loads(c.state_path.read_text())['controller_pid']))
+        def runner(command,**kw):
+            if command[0]=='scp':events.append(('scp',command))
+            elif 'start_services.sh' in (kw.get('input') or ''):events.append(('start',))
+            return remote(command,**kw)
+        c.runner=runner
+        with patch.object(c,'take_over',side_effect=take),patch.object(c,'check_local_ports'),patch.object(c,'present'), \
+             patch.object(c,'backup_remote'),patch('scripts.presentation.time.sleep'),patch('scripts.presentation.sys.platform','linux'):
+            c.run(resume=True)
+        self.assertEqual([e[0] for e in events],['owned']+['scp']*5+['start'])
+        self.assertEqual(events[0][1:],(True,os.getpid()))
+        self.assertEqual([e[1][-1] for e in events if e[0]=='scp'],[f'root@host:/workspace/persona-lab/{t}' for t in
+            ['lab/server.py','lab/static/app.js','lab/static/index.html','lab/static/style.css','scripts/start_services.sh']])
+        for e in events[1:6]:
+            text=' '.join(e[1]);self.assertIn('StrictHostKeyChecking=yes',text);self.assertNotIn('.env',text);self.assertNotIn('.state',text)
+
+    def stop(self,c):
+        with patch('scripts.presentation.Presentation',return_value=c),patch('scripts.presentation.read_key',return_value='k'), \
+             patch('scripts.presentation.sys.argv',['p','--env-file','e','--stop']),patch.object(c,'backup_remote'), \
+             patch('scripts.presentation.time.sleep'):
+            return presentation_main()
+
+    def test_unowned_destroy_is_inert_and_stop_rejects_invalid_state_before_ownership(self):
+        c=self.controller();c.state=dict(self.state);c.owned=False
+        c.destroy();self.assert_untouched()
+        good=dict(self.state)
+        for bad in [{'label':''},{'instance_id':'60502794'},{'purpose':'other'}]:
+            self.state=dict(good,**bad);self.write_state();c=self.controller()
+            with self.assertRaises(SystemExit):self.stop(c)
+            self.assert_untouched()
+
+    def test_direct_stop_after_ambiguous_create_destroys_labelled_rental_only(self):
+        self.state={'purpose':PURPOSE,'label':LABEL,'phase':'creating'};self.write_state()  # no instance ID yet
+        c=self.controller(api=ResumeFakeAPI(label='someone-else'))
+        self.assertEqual(self.stop(c),0)  # a differently labelled instance is never deleted
+        self.assert_untouched()
+        self.state={'purpose':PURPOSE,'label':LABEL,'phase':'creating'};self.write_state()
+        c=self.controller();self.assertEqual(self.stop(c),0)
+        self.assertEqual([call[0] for call in self.api.calls if call[2]=='DELETE'],[f'/api/v0/instances/{ID}/'])
+
+    def test_direct_stop_with_known_absent_instance_confirms_absence(self):
+        self.state['phase']='rented';self.write_state();c=self.controller(api=ResumeFakeAPI(id=5))
+        c.api.live=[];self.assertEqual(self.stop(c),0)
+        self.assertFalse([call for call in c.api.calls if call[2]=='DELETE'])
+        self.assertEqual(json.loads(c.state_path.read_text())['phase'],'destroyed')
+
+    def snapshot(self,shards=('a.safetensors','b.safetensors'),skip=(),broken=()):
+        base=self.root/'hf/hub/models--Qwen--Qwen3.5-4B';snap=base/'snapshots/r1'
+        snap.mkdir(parents=True);(base/'blobs').mkdir()
+        for name in ('config.json','tokenizer_config.json','tokenizer.json'):(snap/name).write_text('{}')
+        (snap/'model.safetensors.index.json').write_text(json.dumps({'weight_map':{'x':shards[0],'y':shards[1],'z':shards[0]}}))
+        for index,name in enumerate(shards):
+            if name in skip:continue
+            if name in broken:(snap/name).symlink_to('../../blobs/missing');continue
+            (base/'blobs'/f'blob{index}').write_bytes(b'weights');(snap/name).symlink_to(f'../../blobs/blob{index}')
+        return base,snap
+    def ready(self):return snapshot_ready(str(self.root/'hf'),'Qwen/Qwen3.5-4B','r1')
+
+    def test_complete_4b_shards_detection(self):
+        self.snapshot();self.assertTrue(self.ready())
+    def test_missing_broken_incomplete_empty_shard_or_tokenizer_is_not_ready(self):
+        self.snapshot(skip=('b.safetensors',));self.assertFalse(self.ready())
+        self.tearDown();self.setUp();self.snapshot(broken=('b.safetensors',));self.assertFalse(self.ready())
+        self.tearDown();self.setUp();base,_=self.snapshot();(base/'blobs/c.incomplete').write_text('x');self.assertFalse(self.ready())
+        self.tearDown();self.setUp();base,_=self.snapshot();(base/'blobs/blob1').write_bytes(b'');self.assertFalse(self.ready())
+        self.tearDown();self.setUp();_,snap=self.snapshot();(snap/'tokenizer_config.json').unlink();self.assertFalse(self.ready())
+
+    def test_active_prefetch_is_never_duplicated_and_guard_precedes_launch(self):
+        c=self.controller();c.state=dict(self.state);c.ssh=['ssh'];c.destination='root@host'
+        with patch.object(c,'update',side_effect=AssertionError('no launch expected')):
+            self.assertFalse(c.ensure_prefetch(MODELS))
+        script=self.remote.calls[0][2]
+        self.assertLess(script.index('pgrep'),script.index('nohup'))
+        self.assertNotIn('kill ',script)
+    def test_single_trusted_launch_when_none_active(self):
+        remote=FakeRemote(self.deadline,active=False);c=self.controller(remote=remote)
+        c.state=dict(self.state);c.ssh=['ssh'];c.destination='root@host'
+        with patch.object(c,'update'):self.assertTrue(c.ensure_prefetch(MODELS[1:]))
+        script=remote.calls[0][2]
+        self.assertEqual(script.count('nohup'),1)
+        self.assertIn('Qwen/Qwen3-8B',script);self.assertNotIn('Qwen3.5-4B',script)
+
+    def test_services_start_when_4b_ready_without_waiting_for_larger_models(self):
+        remote=FakeRemote(self.deadline,ready=[ready_map(),ready_map(four=True)],active=True)
+        c=self.controller(remote=remote)
+        with patch.object(c,'check_local_ports'),patch.object(c,'present') as present,patch.object(c,'backup_remote'), \
+             patch('scripts.presentation.time.sleep'),patch('scripts.presentation.sys.platform','linux'):
+            c.run(resume=True)
+        self.assertEqual(len(remote.scripts('start_services.sh')),1);present.assert_called_once()
+        self.assertEqual(c.pending,MODELS[1:])  # 8B/27B continue in the existing background downloader
+        self.assertNotIn('prefetch_launched_at_unix',c.state)  # downloader reported ACTIVE: no second launch
+        self.assertFalse([call for call in self.api.calls if '/asks/' in call[0]])
+        saved=json.loads((self.root/'.state/presentation.json').read_text())
+        self.assertEqual(saved['controller_pid'],os.getpid());self.assertEqual(saved['deadline_unix'],self.deadline)
+
+    def test_setup_timeout_follows_deadline_not_one_hour(self):
+        c=self.controller();c.bundle=self.root/'bundle';c.ssh=['ssh'];c.destination='root@host'
+        c.state=dict(self.state);seen=[]
+        c.runner=lambda command,**kw:seen.append(kw['timeout'])
+        c.deploy()
+        self.assertGreater(seen[-1],3600);self.assertLessEqual(seen[-1],4*3600)
 
 
 if __name__=='__main__':unittest.main()

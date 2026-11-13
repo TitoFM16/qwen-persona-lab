@@ -72,6 +72,7 @@ if [ "$lab_status" -eq 2 ] || [ "$explorer_status" -eq 2 ]; then
 fi
 
 if [ "$lab_status" -ne 0 ]; then
+  export QWEN_REQUIRE_CACHED_MODELS=1
   nohup "$python" -m lab.server --device cuda --port 8787 > outputs/lab-server.log 2>&1 < /dev/null &
   echo "$!" > .state/lab-server.pid
   echo "Started lab server, PID $(cat .state/lab-server.pid)."

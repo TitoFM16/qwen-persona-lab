@@ -16,9 +16,23 @@ MODELS = ['Qwen/Qwen3.5-4B', 'Qwen/Qwen3-8B', 'Qwen/Qwen3.8-27B']
 class WorkerBusyError(RuntimeError):
     pass
 
+class ModelNotReadyError(WorkerBusyError):
+    """Requested model is not fully cached yet (HTTP 409 via WorkerBusyError handling)."""
+
+def _default_cache_lookup(model, filename, revision):
+    from huggingface_hub import try_to_load_from_cache
+    return try_to_load_from_cache(model, filename, revision=revision)
+
 class Application:
-    def __init__(self, db_path, device='cuda', worker_status_file=None, judge_status_file=None, catalog_only=False):
+    def __init__(self, db_path, device='cuda', worker_status_file=None, judge_status_file=None, catalog_only=False,
+                 require_cached_models=None, manifest_path=None, cache_lookup=None):
         from lab.catalog import Catalog
+        import os
+        if require_cached_models is None:
+            require_cached_models = os.environ.get('QWEN_REQUIRE_CACHED_MODELS') == '1'
+        self.require_cached_models = bool(require_cached_models)
+        self.manifest_path = Path(manifest_path or os.environ.get('QWEN_REVISION_MANIFEST') or ROOT.parent.parent / 'data/model-cache-manifest.json')
+        self.cache_lookup = cache_lookup or _default_cache_lookup
         self.db_path = db_path
         self._catalog_local = threading.local()
         initial = Catalog(db_path)
@@ -49,6 +63,46 @@ class Application:
                 from lab.steering import ModelRuntime
                 self._runtime = ModelRuntime(device=self.device)
             return self._runtime
+
+    def model_readiness(self, model):
+        """Cache-only check: pinned config and every weight shard present with exact manifest size. Never downloads or loads."""
+        def result(ready, reason, done=0, total=0):
+            return {'ready': ready, 'reason': reason, 'downloaded_bytes': done, 'total_bytes': total}
+        try:
+            manifest = json.loads(self.manifest_path.read_text())
+            entry = manifest['models'][model]
+            revision = entry['revision']
+            weights = [(w['name'], int(w['bytes'])) for w in entry['weights']]
+        except FileNotFoundError:
+            return result(False, 'Model cache manifest is missing; cannot confirm this model is downloaded.')
+        except (OSError, ValueError, KeyError, TypeError):
+            return result(False, 'This model is not listed in the pinned download manifest.')
+        total = sum(size for _, size in weights)
+        try:
+            config = self.cache_lookup(model, 'config.json', revision)
+        except Exception:
+            return result(False, 'Model cache check is unavailable (huggingface_hub missing?).', 0, total)
+        done, missing = 0, []
+        try:
+            config_ok = isinstance(config, (str, Path)) and Path(config).is_file()
+            if config_ok and entry.get('config_sha256'):
+                import hashlib
+                config_ok = hashlib.sha256(Path(config).read_bytes()).hexdigest() == entry['config_sha256']
+        except OSError:
+            config_ok = False
+        for name, size in weights:
+            try:
+                path = self.cache_lookup(model, name, revision)
+                if isinstance(path, (str, Path)) and Path(path).stat().st_size == size:
+                    done += size
+                    continue
+            except Exception:
+                pass
+            missing.append(name)
+        if config_ok and not missing:
+            return result(True, 'Ready', done, total)
+        gib = lambda n: f'{n / 2**30:.1f}'
+        return result(False, f'This model is still downloading ({gib(done)} of {gib(total)} GiB of completed weight files verified). Choose an already-ready model meanwhile.', done, total)
 
     @staticmethod
     def read_telemetry(path):
@@ -102,6 +156,7 @@ class Application:
         block_reason = self.live_chat_block_reason(worker, judge)
         return {'counts': self.catalog.stats(), 'runtime': runtime, 'worker': worker, 'judge': judge,
                 'live_chat_available': block_reason is None, 'live_chat_block_reason': block_reason, 'models': MODELS,
+                'model_readiness': {m: self.model_readiness(m) for m in MODELS} if self.require_cached_models else {},
                 'atlas': {'Qwen/Qwen3.5-4B': {'available': False, 'assets_present': (ROOT.parent.parent / 'vendor/neuron-explorer/explorer/cache').exists(), 'reason': 'Original upstream 3D source and assets are preserved under vendor/neuron-explorer. Launch its local server separately using the documented safe launcher, then forward port 8791.'},
                           'Qwen/Qwen3-8B': {'available': (ROOT.parent.parent / 'data/sources/neuronpersonas/atlas.json').is_file(), 'reason': 'Published model-specific 2D neuron atlas imported from neuronpersonas.com. This is an indexed category atlas, not a 3D embedding.'},
                           'Qwen/Qwen3.8-27B': {'available': False, 'reason': 'No verified model-specific visualization data. Steering support must be validated on GPU.'}}}
@@ -187,6 +242,10 @@ class Application:
                 raise WorkerBusyError(block_reason)
             model = body.get('model')
             if model not in MODELS: raise ValueError('Unsupported model')
+            if self.require_cached_models:
+                readiness = self.model_readiness(model)
+                if not readiness['ready']:
+                    raise ModelNotReadyError(readiness['reason'])
             prompt = body.get('prompt','')
             if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>24000: raise ValueError('Enter a prompt of at most 24,000 characters')
             components = body.get('components',[])

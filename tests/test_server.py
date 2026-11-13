@@ -168,6 +168,83 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response[0],200)
         self.assertEqual(response[1]['recipe']['source'],'custom')
 
+    def make_gated_app(self,sizes_on_disk,present=None):
+        """Fake manifest + tiny files; lookup is injected and never touches network or the real HF cache."""
+        import hashlib
+        root=Path(self.temp.name)/'fake-cache'; root.mkdir(exist_ok=True)
+        rev='a'*40; models={}
+        for model,(w1,w2) in {'Qwen/Qwen3.5-4B':(4,6),'Qwen/Qwen3-8B':(5,7),'Qwen/Qwen3.8-27B':(8,9)}.items():
+            tag=model.replace('/','_'); cfg=b'{}'
+            models[model]={'revision':rev,'config_sha256':hashlib.sha256(cfg).hexdigest(),
+                           'weights':[{'name':'a.safetensors','bytes':w1,'cache_blob_key':'k1'},{'name':'b.safetensors','bytes':w2,'cache_blob_key':'k2'}]}
+            if present is None or model in present:
+                (root/f'{tag}-config.json').write_bytes(cfg)
+                for name,size in (('a.safetensors',w1),('b.safetensors',w2)):
+                    on_disk=sizes_on_disk.get((model,name),size)
+                    if on_disk is not None: (root/f'{tag}-{name}').write_bytes(b'x'*on_disk)
+        manifest=Path(self.temp.name)/'manifest.json'; manifest.write_text(json.dumps({'models':models}))
+        lookups=[]
+        def lookup(model,filename,revision):
+            lookups.append((model,filename,revision))
+            path=root/f"{model.replace('/','_')}-{filename}"
+            return str(path) if path.exists() else None
+        app=Application(str(Path(self.temp.name)/'gated.sqlite3'),worker_status_file=self.worker_file,judge_status_file=self.judge_file,
+                        require_cached_models=True,manifest_path=manifest,cache_lookup=lookup)
+        self.addCleanup(app.close_catalog)
+        app.lookups=lookups
+        return app
+
+    def test_default_flag_unset_is_nonrestrictive(self):
+        self.assertFalse(self.app.require_cached_models)
+        self.assertEqual(self.app.status()['model_readiness'],{})
+
+    def test_all_cached_models_ready(self):
+        app=self.make_gated_app({})
+        readiness=app.status()['model_readiness']
+        self.assertEqual(set(readiness),{'Qwen/Qwen3.5-4B','Qwen/Qwen3-8B','Qwen/Qwen3.8-27B'})
+        for item in readiness.values():
+            self.assertTrue(item['ready']); self.assertEqual(item['downloaded_bytes'],item['total_bytes'])
+        self.assertTrue(all(rev=='a'*40 for _,_,rev in app.lookups))
+
+    def test_missing_or_mismatched_weight_is_not_ready(self):
+        app=self.make_gated_app({('Qwen/Qwen3.8-27B','b.safetensors'):None,('Qwen/Qwen3-8B','a.safetensors'):1})
+        readiness=app.status()['model_readiness']
+        self.assertTrue(readiness['Qwen/Qwen3.5-4B']['ready'])
+        self.assertFalse(readiness['Qwen/Qwen3.8-27B']['ready'])
+        self.assertEqual(readiness['Qwen/Qwen3.8-27B']['downloaded_bytes'],8)
+        self.assertEqual(readiness['Qwen/Qwen3.8-27B']['total_bytes'],17)
+        self.assertFalse(readiness['Qwen/Qwen3-8B']['ready'])
+        self.assertIn('downloading',readiness['Qwen/Qwen3-8B']['reason'])
+
+    def test_missing_config_manifest_or_dependency_fails_closed(self):
+        app=self.make_gated_app({},present={'Qwen/Qwen3.5-4B'})
+        self.assertTrue(app.model_readiness('Qwen/Qwen3.5-4B')['ready'])
+        self.assertFalse(app.model_readiness('Qwen/Qwen3-8B')['ready'])
+        app.manifest_path=Path(self.temp.name)/'absent.json'
+        self.assertFalse(app.model_readiness('Qwen/Qwen3.5-4B')['ready'])
+        app.manifest_path=Path(self.temp.name)/'manifest.json'
+        def broken(*args): raise ImportError('no huggingface_hub')
+        app.cache_lookup=broken
+        self.assertFalse(app.model_readiness('Qwen/Qwen3.5-4B')['ready'])
+
+    def test_uncached_compare_returns_409_without_runtime_and_ready_model_still_runs(self):
+        app=self.make_gated_app({('Qwen/Qwen3.8-27B','a.safetensors'):None})
+        def forbidden(): raise AssertionError('runtime must not be constructed for an uncached model')
+        app.runtime=forbidden
+        body=json.dumps({'model':'Qwen/Qwen3.8-27B','prompt':'hi','components':[]}).encode()
+        self.app=app
+        response=self.request('POST','/api/compare',{'Host':'127.0.0.1:8787','Origin':'http://127.0.0.1:8787',
+                              'X-Lab-Request':'1','Content-Length':str(len(body)),'Content-Type':'application/json'},body)
+        self.assertEqual(response[0],409)
+        self.assertIn('still downloading',response[1]['error'])
+        self.assertIsNone(app._runtime)
+        class Runtime:
+            def compare(self,*a,**k): return {'baseline':'b','steered':'s','metrics':{},'provenance':{}}
+        del app.runtime
+        app._runtime=Runtime()
+        result=app.post('/api/compare',{'model':'Qwen/Qwen3.5-4B','prompt':'hi','components':[]})
+        self.assertEqual(result['steered'],'s')
+
     def test_actual_published_atlas_integrity_and_hit_mapping(self):
         path=Path('data/sources/neuronpersonas/atlas.json')
         if not path.is_file():self.skipTest('Published atlas not downloaded')

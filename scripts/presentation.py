@@ -10,6 +10,7 @@ import argparse
 import datetime
 import fcntl
 import fnmatch
+import inspect
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,37 @@ from scripts import vast_gpu
 ROOT=Path(__file__).resolve().parents[1]
 PURPOSE='qwen-persona-presentation-v1'
 MODELS=['Qwen/Qwen3.5-4B','Qwen/Qwen3-8B','Qwen/Qwen3.8-27B']
+# Setup is bounded by the absolute session deadline (remaining()), never by a fixed hour.
+SETUP_CEILING=12*3600
+REMOTE_ROOT='/workspace/persona-lab'
+REMOTE_ENV='export HF_HOME=/workspace/hf-cache; '
+
+
+class HandoffRejected(ValueError):
+    """Read-only adoption validation failed; nothing may be destroyed or changed."""
+
+
+def snapshot_ready(hf_home,model,revision):
+    """Stdlib-only (also executed remotely): pinned snapshot is complete and loadable."""
+    import json,os
+    snapshot=os.path.join(hf_home,'hub','models--'+model.replace('/','--'),'snapshots',revision)
+    def good(name):
+        if not name or name.startswith('/') or '..' in name.split('/') or name.endswith('.incomplete'):return False
+        path=os.path.join(snapshot,name)
+        try:return os.path.isfile(path) and os.stat(path).st_size>0  # follows links; broken link -> False
+        except OSError:return False
+    try:
+        if any(name.endswith('.incomplete') for name in os.listdir(os.path.join(snapshot,'..','..','blobs'))):return False
+    except OSError:return False
+    if not (good('config.json') and good('tokenizer_config.json') and (good('tokenizer.json') or good('vocab.json'))):
+        return False
+    try:
+        with open(os.path.join(snapshot,'model.safetensors.index.json')) as handle:index=json.load(handle)
+    except OSError:return good('model.safetensors')
+    except ValueError:return False
+    shards=index.get('weight_map') if isinstance(index,dict) else None
+    if not isinstance(shards,dict) or not shards:return False
+    return all(isinstance(name,str) and good(name) for name in set(shards.values()))
 
 
 def session_deadline(duration_hours=2,until=None,now=None):
@@ -133,6 +165,8 @@ class Presentation:
         self.runner=runner or subprocess.run
         self.state_path=self.root/'.state/presentation.json'
         self.state={};self.tunnel=None;self.bundle=None;self.log=None;self.awake=None;self.backup_done=False
+        self.owned=True;self.lock=None;self.pending=[];self.next_poll=0;self.wanted=[]
+        self.marker_path=self.root/'.state/presentation-handoff.json'
 
     def update(self,**values):
         self.state.update(values);save_state(self.state_path,self.state)
@@ -295,8 +329,182 @@ class Presentation:
         if self.args.fast_kernels:
             setup+='apt-get update; apt-get install -y --no-install-recommends gcc g++; .venv/bin/python -m pip install flash-linear-attention==0.6.0 fla-core==0.6.0; '
         setup+='.venv/bin/python -c '+shlex.quote(download)+'; bash scripts/start_services.sh'
-        self.command(self.ssh+[self.destination,setup],maximum=3600)
+        self.command(self.ssh+[self.destination,setup],maximum=SETUP_CEILING)
         self.update(phase='ready')
+
+    # ---- adoption of an already-running owned rental (never rents, never extends the deadline) ----
+    def remote(self,script,maximum=60):
+        """Run a trusted script via stdin so it never appears in a remote process command line."""
+        result=self.runner(self.ssh+[self.destination,'bash -s'],check=True,timeout=self.remaining(maximum),
+            env=clean_environment(),input=script,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        return result.stdout
+
+    def check_local_ports(self):
+        for port in [8787,8791]:
+            with socket.socket() as probe:
+                try:probe.bind(('127.0.0.1',port))
+                except OSError:raise HandoffRejected(f'Local port {port} is occupied')
+
+    def preflight(self,ports=True):
+        """Read-only: local state, provider ownership and remote timer. Writes nothing."""
+        try:state=json.loads(self.state_path.read_text())
+        except (OSError,ValueError):raise HandoffRejected('No readable presentation state')
+        expected=getattr(self.args,'expected_instance_id',None)
+        if state.get('purpose')!=PURPOSE:raise HandoffRejected('State purpose mismatch')
+        if type(state.get('instance_id')) is not int or state['instance_id']!=expected:
+            raise HandoffRejected('State instance ID does not match --expected-instance-id')
+        if state.get('phase') in ('destroyed','cleanup_failed'):raise HandoffRejected('Rental already ended')
+        label=state.get('label')
+        if not isinstance(label,str) or not label:raise HandoffRejected('State has no label')
+        saved=state.get('deadline_unix')
+        if not isinstance(saved,(int,float)) or saved<=time.time():raise HandoffRejected('Saved deadline is missing or expired')
+        try:
+            parsed=datetime.datetime.fromisoformat(self.args.until.replace('Z','+00:00'))
+            if parsed.utcoffset() is None:raise ValueError
+            wanted=parsed.timestamp()
+        except (ValueError,TypeError,AttributeError):raise HandoffRejected('--until must be a timezone-aware saved absolute deadline')
+        if abs(wanted-saved)>1:raise HandoffRejected('--until differs from the saved deadline; deadlines are never extended')
+        host,port,known=state.get('ssh_host'),state.get('ssh_port'),state.get('known_hosts')
+        if not host or not port or not known or not Path(known).is_file():
+            raise HandoffRejected('Saved SSH host/port/known-hosts are incomplete')
+        rows=[row for row in self.api('/api/v1/instances/?owner=me').get('instances',[]) if row.get('id')==expected]
+        if len(rows)!=1:raise HandoffRejected('Instance is not in this provider account')
+        row=rows[0]
+        if row.get('label')!=label:raise HandoffRejected('Provider label does not match saved label')
+        if row.get('actual_status')!='running':raise HandoffRejected('Provider instance is not running')
+        if (row.get('ssh_host') not in (None,host)) or (row.get('ssh_port') not in (None,port)):
+            raise HandoffRejected('Provider SSH endpoint differs from saved endpoint')
+        if ports:self.check_local_ports()
+        self.state=state;self.destination=f'root@{host}'
+        self.ssh=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','-o','ServerAliveInterval=30',
+                  '-o','ServerAliveCountMax=3','-o','StrictHostKeyChecking=yes','-o',f'UserKnownHostsFile={known}','-p',str(port)]
+        private=Path(self.args.key).expanduser().with_suffix('')
+        if private.is_file():self.ssh+=['-i',str(private),'-o','IdentitiesOnly=yes']
+        try:timer=json.loads(self.remote(f'cat {REMOTE_ROOT}/.state/remote-deadline.json',30))
+        except ValueError:raise HandoffRejected('Remote timer status is unreadable')
+        if (not isinstance(timer,dict) or timer.get('state')!='armed' or timer.get('instance_id')!=expected
+                or not isinstance(timer.get('deadline_unix'),(int,float)) or abs(timer['deadline_unix']-saved)>1
+                or type(timer.get('pid')) is not int):
+            raise HandoffRejected('Remote timer is not armed for this instance and deadline')
+        if 'alive' not in self.remote(f'test -d /proc/{timer["pid"]} && echo alive',30):
+            raise HandoffRejected('Remote timer process is not running')
+        return {key:timer[key] for key in ('state','instance_id','deadline_unix','pid')}
+
+    def write_marker(self,timer,phase='ready_for_takeover'):
+        save_state(self.marker_path,{'purpose':PURPOSE,'instance_id':self.state['instance_id'],
+            'old_pid':self.state.get('controller_pid'),'new_pid':os.getpid(),
+            'deadline_unix':self.state['deadline_unix'],'deadline_utc':self.state.get('deadline_utc'),
+            'validated_timer':timer,'phase':phase,'written_at_unix':time.time()})
+
+    def remove_marker(self):
+        try:
+            if json.loads(self.marker_path.read_text()).get('new_pid')==os.getpid():self.marker_path.unlink()
+        except (OSError,ValueError):pass
+
+    def try_lock(self):
+        try:fcntl.flock(self.lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:return False
+        return True
+
+    SYNC_FILES=[('lab/server.py','lab/server.py'),('lab/static/app.js','lab/static/app.js'),
+                ('lab/static/index.html','lab/static/index.html'),('lab/static/style.css','lab/static/style.css'),
+                ('scripts/start_services.sh','scripts/start_services.sh')]
+
+    def await_ownership(self):
+        """Preflight, publish marker, then acquire the old controller's flock. Acquires the lock ONLY:
+        cleanup ownership is granted later by take_over() after revalidation and the state commit."""
+        for source,_ in self.SYNC_FILES:
+            if not (self.root/source).is_file():raise HandoffRejected(f'Local file to deploy is missing: {source}')
+        timer=self.preflight()
+        self.write_marker(timer)
+        self.lock=(self.root/'.state/presentation.lock').open('a')
+        if not self.try_lock():
+            print(f'Validated handoff; waiting for old controller PID {self.state.get("controller_pid")} to release the lock. '
+                  'It still protects the rental.',flush=True)
+            while not self.try_lock():time.sleep(min(.5,self.remaining(.5)))
+        return timer
+
+    def take_over(self,timer):
+        """Holding the exclusive lock: revalidate account/id/label/timer, atomically commit state, ONLY THEN own cleanup."""
+        for attempt in range(3):
+            try:fresh=self.preflight(ports=False);break
+            except subprocess.SubprocessError:
+                if attempt==2:raise
+                time.sleep(min(5,self.remaining(5)))
+        if fresh.get('deadline_unix')!=timer.get('deadline_unix'):raise HandoffRejected('Remote timer changed during handoff')
+        committed=dict(self.state,controller_pid=os.getpid(),phase='adopting',adopted_at_unix=time.time(),
+                       provider_deadline_configured=True,remote_deadline_status='armed')
+        save_state(self.state_path,committed)  # atomic; raising leaves main state untouched and us unowned
+        self.state=committed;self.owned=True
+        try:self.write_marker(fresh,'taken_over')
+        except OSError:pass  # informational; the main-state commit is the ownership record
+
+    def sync_files(self):
+        """Copy the newest local UI/server files to the rental (never credentials/.state/.env)."""
+        base=['scp','-P',str(self.state['ssh_port']),'-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
+              '-o',f"UserKnownHostsFile={self.state['known_hosts']}"]
+        private=Path(self.args.key).expanduser().with_suffix('')
+        if private.is_file():base+=['-i',str(private),'-o','IdentitiesOnly=yes']
+        for source,target in self.SYNC_FILES:
+            self.command(base+[str(self.root/source),f'{self.destination}:{REMOTE_ROOT}/{target}'],maximum=120)
+
+    def adopt(self):
+        for tool in ['ssh','scp','bash']:
+            if shutil.which(tool) is None:raise ValueError(f'Required local command unavailable: {tool}')
+        if sys.platform=='darwin' and shutil.which('caffeinate'):
+            self.awake=subprocess.Popen(['caffeinate','-i','-w',str(os.getpid())],
+                env=clean_environment(),start_new_session=True)
+        (self.root/'outputs').mkdir(exist_ok=True)
+        self.log=(self.root/'outputs/presentation-setup.log').open('a',buffering=1)
+        self.wanted=list(dict.fromkeys(['Qwen/Qwen3.5-4B']+list(self.args.models)))
+        print('Adopted existing rental; waiting for pinned Qwen3.5-4B (8B/27B continue in background).',flush=True)
+        while True:
+            ready=self.cache_ready()
+            if ready and ready.get(MODELS[0]):break
+            if ready is not None:self.ensure_prefetch([m for m in self.wanted if not ready.get(m)])
+            time.sleep(min(15,self.remaining(15)))
+        for attempt in range(3):  # newest guarded UI/server files first, then the trusted start script
+            try:self.sync_files();break
+            except subprocess.SubprocessError:
+                if attempt==2:raise
+                time.sleep(min(10,self.remaining(10)))
+        for attempt in range(3):
+            try:
+                self.remote(f'cd {REMOTE_ROOT}; {REMOTE_ENV}bash scripts/start_services.sh',900);break
+            except subprocess.SubprocessError:
+                if attempt==2:raise
+                time.sleep(min(10,self.remaining(10)))
+        self.update(phase='ready',services_started_at_unix=time.time())
+        self.poll_models(ready)
+
+    def cache_ready(self):
+        """{model: bool} from the pinned manifest and remote cache; None if the remote check failed."""
+        script=(f"cd {REMOTE_ROOT}; {REMOTE_ENV}python3 - <<'PY'\n"+inspect.getsource(snapshot_ready)+
+                '\nimport json,os\nmanifest=json.load(open("data/model-cache-manifest.json"))["models"]\n'
+                'print(json.dumps({m:snapshot_ready(os.environ["HF_HOME"],m,v["revision"]) for m,v in manifest.items()}))\nPY\n')
+        try:return {m:v is True for m,v in json.loads(self.remote(script,60)).items()}
+        except (subprocess.SubprocessError,ValueError):return None
+
+    def ensure_prefetch(self,missing):
+        """Launch at most one trusted pinned downloader, and only if none is already active."""
+        if not missing:return False
+        code=('import json; from huggingface_hub import snapshot_download; '
+              'manifest=json.load(open("data/model-cache-manifest.json"))["models"]; '+
+              '; '.join(f'snapshot_download({m!r},revision=manifest[{m!r}]["revision"])' for m in missing))
+        script=("if pgrep -f '[s]napshot_download' >/dev/null; then echo ACTIVE; exit 0; fi\n"
+                f'cd {REMOTE_ROOT}; {REMOTE_ENV}nohup .venv/bin/python -c {shlex.quote(code)} '
+                '> outputs/presentation-prefetch.log 2>&1 < /dev/null &\necho LAUNCHED\n')
+        try:launched='LAUNCHED' in self.remote(script,30)
+        except subprocess.SubprocessError:return False
+        if launched:self.update(prefetch_launched_at_unix=time.time(),prefetch_models=list(missing))
+        return launched
+
+    def poll_models(self,ready=None):
+        ready=self.cache_ready() if ready is None else ready
+        if ready is None:return
+        self.pending=[m for m in self.wanted if not ready.get(m)]
+        if self.pending:self.ensure_prefetch(self.pending)
+        else:self.update(models_status='all_ready')
 
     def present(self):
         self.tunnel=subprocess.Popen(['bash',str(self.root/'scripts/tunnel.sh'),self.state['ssh_host'],
@@ -308,6 +516,8 @@ class Presentation:
             saved=json.loads(self.state_path.read_text())
             if saved.get('phase')=='destroyed':return
             if self.tunnel.poll() is not None:raise RuntimeError('Tunnel controller exited')
+            if self.pending and time.monotonic()>=self.next_poll:
+                self.next_poll=time.monotonic()+30;self.poll_models()
             if not self.backup_done and self.state['deadline_unix']-time.time()<=130:
                 self.backup_remote()
             time.sleep(self.remaining(5))
@@ -360,7 +570,7 @@ class Presentation:
             print('Evidence backup failed or timed out; rental destruction will still proceed.',file=sys.stderr,flush=True)
 
     def destroy(self):
-        if self.state.get('purpose')!=PURPOSE:return
+        if not self.owned or self.state.get('purpose')!=PURPOSE:return
         instance=self.state.get('instance_id')
         for attempt in range(3):
             try:
@@ -385,22 +595,28 @@ class Presentation:
                     raise RuntimeError('Cleanup could not be confirmed. Use --stop or destroy the recorded instance in Vast immediately.') from error
                 time.sleep(2)
 
-    def run(self):
+    def run(self,resume=False):
+        self.owned=not resume
         try:
-            self.prepare();self.rent();self.wait_ssh();self.deploy();self.present()
+            if resume:self.take_over(self.await_ownership());self.adopt();self.present()
+            else:self.prepare();self.rent();self.wait_ssh();self.deploy();self.present()
         finally:
             # A second Ctrl+C or a vanished SSH child must not skip paid-resource cleanup.
             saved={sig:signal.signal(sig,signal.SIG_IGN) for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]}
             try:
-                try:
-                    if self.tunnel is not None:
-                        try:
-                            self.tunnel.terminate();self.tunnel.wait(timeout=5)
-                        except subprocess.TimeoutExpired:os.killpg(self.tunnel.pid,signal.SIGKILL)
-                        except ProcessLookupError:pass
-                finally:
-                    try:self.backup_remote()
-                    finally:self.destroy()
+                if not self.owned:  # no committed ownership: release lock; old controller/rental untouched
+                    self.remove_marker()
+                    if self.lock is not None:self.lock.close();self.lock=None
+                else:
+                    try:
+                        if self.tunnel is not None:
+                            try:
+                                self.tunnel.terminate();self.tunnel.wait(timeout=5)
+                            except subprocess.TimeoutExpired:os.killpg(self.tunnel.pid,signal.SIGKILL)
+                            except ProcessLookupError:pass
+                    finally:
+                        try:self.backup_remote()
+                        finally:self.destroy()
             finally:
                 if self.log is not None:self.log.close()
                 if self.bundle is not None:self.bundle.unlink(missing_ok=True)
@@ -421,13 +637,22 @@ def main():
     timing.add_argument('--duration-hours',type=float,default=2)
     timing.add_argument('--until',help='Explicit timezone-aware destruction timestamp, at most 12 hours away')
     parser.add_argument('--max-total',type=float,default=23,help='Maximum estimated compute/storage session cost in USD')
-    parser.add_argument('--models','--prefetch-models',dest='models',nargs='+',choices=MODELS,default=['Qwen/Qwen3.5-4B'])
+    parser.add_argument('--models','--prefetch-models',dest='models',nargs='+',choices=MODELS,default=None,
+                        help='Default: 4B for a new rental, all three when adopting')
+    parser.add_argument('--resume-existing',action='store_true',
+                        help='Adopt the saved owned rental after a read-only preflight; never rents or extends the deadline')
+    parser.add_argument('--expected-instance-id',type=int,help='Required with --resume-existing')
     parser.add_argument('--fast-kernels',action='store_true')
     parser.add_argument('--open-browser',action='store_true')
     parser.add_argument('--stop',action='store_true',help='Destroy only the rental recorded by this presentation controller')
     args=parser.parse_args()
     if not 0<args.max_hourly<=2 or not 0<args.max_total:
         parser.error('Hourly limit must be positive and at most 2; total estimate budget must be positive')
+    if args.resume_existing:
+        if args.stop or args.expected_instance_id is None or not args.until:
+            parser.error('--resume-existing requires --expected-instance-id and --until (the saved deadline), not --stop')
+    elif args.expected_instance_id is not None:parser.error('--expected-instance-id is only for --resume-existing')
+    if args.models is None:args.models=list(MODELS) if args.resume_existing else ['Qwen/Qwen3.5-4B']
     try:session_deadline(args.duration_hours,args.until)
     except ValueError as error:parser.error(str(error))
     os.environ['VAST_AI_API_KEY']=read_key(args.env_file)
@@ -435,6 +660,10 @@ def main():
     if args.stop:
         controller.state=json.loads(controller.state_path.read_text())
         if controller.state.get('purpose')!=PURPOSE:raise SystemExit('Unrecognized state; refusing to destroy any rental')
+        label,known=controller.state.get('label'),controller.state.get('instance_id')
+        if not isinstance(label,str) or not label or not (known is None or type(known) is int):
+            raise SystemExit('State lacks a valid label/instance ID; refusing to destroy any rental')
+        controller.owned=True  # explicit operator --stop: granted only after purpose+ID+label validation
         try:controller.backup_remote()
         finally:controller.destroy()
         return 0
@@ -443,12 +672,17 @@ def main():
     # Respect nohup's inherited SIGHUP ignore policy for a detached controller.
     if signal.getsignal(signal.SIGHUP)!=signal.SIG_IGN:signal.signal(signal.SIGHUP,interrupt)
     (ROOT/'.state').mkdir(exist_ok=True)
-    lock=(ROOT/'.state/presentation.lock').open('a')
-    try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    except BlockingIOError:raise SystemExit('Another presentation controller is active; use --stop to destroy its rental')
-    try:controller.run()
-    except KeyboardInterrupt:print('Presentation stopped; cleanup completed.',flush=True)
-    except TimeoutError:print('Presentation deadline/setup timeout reached; cleanup completed.',flush=True)
+    if not args.resume_existing:
+        lock=(ROOT/'.state/presentation.lock').open('a')
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise SystemExit('Another presentation controller is active; use --stop to destroy its rental')
+    try:controller.run(resume=args.resume_existing)
+    except KeyboardInterrupt:
+        print('Presentation stopped; cleanup completed.' if controller.owned else
+              'Handoff cancelled before ownership; old controller and rental untouched.',flush=True)
+    except TimeoutError:
+        print('Presentation deadline/setup timeout reached; cleanup completed.' if controller.owned else
+              'Deadline reached before ownership; nothing was changed.',flush=True)
     except Exception as error:
         print(f'Presentation failed: {error}',file=sys.stderr);return 1
     return 0

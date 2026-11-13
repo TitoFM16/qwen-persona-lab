@@ -65,6 +65,28 @@ Open **http://127.0.0.1:8787** for the persona lab and **http://127.0.0.1:8791**
 
 There are no local copies of the roughly 76 GB GPU model cache. A fresh rental downloads the requested models again. Allow at least 15 minutes for the small-model setup and plan **30–60 minutes of lead time when prefetching all three**, depending on image pulls, offer networking, Hugging Face throughput and package downloads. The script's default is only 4B, but the command above explicitly requests all three. Follow `outputs/presentation-setup.log` from another Terminal while setup runs.
 
+## Adopt a running rental (`--resume-existing`) and controller handoff
+
+Use this only when a controller process is already running a rental whose setup is stuck behind the old fixed one-hour SSH limit (new controllers no longer have it; setup waits are bounded by the absolute deadline). Adoption never rents, never extends the deadline, never bootstraps and never re-arms the remote timer.
+
+Required: `--expected-instance-id ID` and `--until` equal to the saved deadline. Example (instance 60502794, deadline 2026-11-13T21:00:00Z):
+
+```bash
+caffeinate -i .venv/bin/python scripts/presentation.py --env-file /private/path/keys.env \
+  --resume-existing --expected-instance-id 60502794 --until 2026-11-13T21:00:00Z
+```
+
+Phase 1 (read-only, old controller still protects the rental): validates saved purpose/ID/label/unexpired deadline, finds the instance with the same ID and label in the provider account (running, same SSH endpoint), connects over strict-host-key SSH using the saved known-hosts, and reads `.state/remote-deadline.json` (must be `armed`, same instance, same deadline, timer process alive). Any failure exits without touching state, the lock, the old controller or the rental. It then writes `.state/presentation-handoff.json` (`phase: ready_for_takeover`, `old_pid`, `new_pid`, validated timer) and polls the `.state/presentation.lock` flock.
+
+Phase 2 (root/operator):
+
+1. Check the marker: `cat .state/presentation-handoff.json` shows `ready_for_takeover`, the expected `old_pid` and live `new_pid`.
+2. Kill **only the old local controller**: `kill -KILL OLD_PID`. **Never SIGTERM/SIGINT/Ctrl+C/`--stop` on the old controller**: its cleanup destroys the rental. Cancel an unwanted replacement with Ctrl+C on the *replacement* while the marker says `ready_for_takeover`; that touches nothing.
+3. The replacement acquires the lock only. While holding it, it revalidates account/ID/label and the unchanged armed timer, then atomically commits its PID to `.state/presentation.json`. **Only after that commit** does it own cleanup and set the marker to `taken_over`. Any failure, timeout or cancel before the commit releases the lock, removes the marker, leaves main state untouched and makes zero DELETE calls. From then on Ctrl+C/deadline/`--stop` destroy the rental (bounded backup first). Explicit `--stop` is validated (purpose, label, integer-or-absent instance ID) before it may delete; `destroy()` is inert for any controller without ownership.
+4. After the commit, and before `start_services.sh`, the controller copies the newest local `lab/server.py`, `lab/static/{app.js,index.html,style.css}` and `scripts/start_services.sh` to `/workspace/persona-lab` over strict-host-key scp (no credentials, `.state` or `.env`). All five local files must exist before the marker is written. The existing remote downloader is never restarted.
+
+Models: readiness uses the pinned revisions in `data/model-cache-manifest.json`; Qwen3.5-4B is ready only when config, tokenizer files and every unique shard in `model.safetensors.index.json` exist as complete non-empty files (broken links and `.incomplete` blobs are not ready). As soon as 4B is ready the controller runs `scripts/start_services.sh` and opens tunnels; 8B/27B continue in the background (default `--models` is all three when adopting). It launches one trusted `nohup` pinned downloader only if no `snapshot_download` process is already running; it never signals existing remote processes. Caveat: if the old SSH session's death hangs up a downloader that is not `nohup`/detached, that is outside this controller; check the remote `pgrep -af snapshot_download` after the SIGKILL.
+
 ## End the presentation and remove the rental
 
 Press **Ctrl+C** in the controller Terminal. It closes only its own tunnel and **destroys its recorded rental**, rather than merely stopping the GPU and retaining paid disk storage. It confirms the instance is absent from the provider listing. Setup errors, normal termination and the wall-clock deadline use the same cleanup path.
