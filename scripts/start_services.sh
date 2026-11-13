@@ -3,13 +3,30 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
-export EXPLORER_MODEL=Qwen/Qwen3.5-4B
 unset EXPLORER_NO_MODEL
 mkdir -p outputs .state
 python=.venv/bin/python
 if [ ! -x "$python" ]; then
   echo "Missing .venv/bin/python. Run scripts/bootstrap_gpu.sh first." >&2
   exit 1
+fi
+export QWEN_REVISION_MANIFEST="${QWEN_REVISION_MANIFEST:-$PWD/data/model-cache-manifest.json}"
+if [ -f "$QWEN_REVISION_MANIFEST" ]; then
+  EXPLORER_MODEL=$("$python" - "$QWEN_REVISION_MANIFEST" <<'PY'
+import json, sys
+from pathlib import Path
+from huggingface_hub import try_to_load_from_cache
+model='Qwen/Qwen3.5-4B'
+revision=json.load(open(sys.argv[1]))['models'][model]['revision']
+cached=try_to_load_from_cache(model,'config.json',revision=revision)
+if not isinstance(cached,str) or not Path(cached).is_file():
+    raise SystemExit('Pinned Qwen3.5-4B snapshot is missing; prefetch the manifest revision first.')
+print(Path(cached).parent)
+PY
+  ) || exit 1
+  export EXPLORER_MODEL
+else
+  export EXPLORER_MODEL=Qwen/Qwen3.5-4B
 fi
 
 # 0 = expected healthy service; 1 = no listener; 2 = occupied/incompatible.

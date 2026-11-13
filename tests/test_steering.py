@@ -2,7 +2,8 @@ import math
 import types
 import unittest
 
-from lab.steering import Intervention, ModelRuntime, decoder_layers, validate_components, resolve_model_revision
+from lab.steering import (Intervention, ModelRuntime, decoder_layers, validate_components,
+                          resolve_model_revision, requested_model_revision)
 
 
 class RevisionTests(unittest.TestCase):
@@ -40,6 +41,7 @@ class RevisionTests(unittest.TestCase):
                 AutoModelForCausalLM=causal,AutoModelForImageTextToText=multimodal)
             fake_torch=types.SimpleNamespace(float32='float32',bfloat16='bfloat16',cuda=types.SimpleNamespace(is_available=lambda:False))
             with patch.dict(sys.modules,{'torch':fake_torch,'transformers':transformers}), \
+                 patch.dict('os.environ', {'QWEN_REVISION_MANIFEST': ''}), \
                  patch('huggingface_hub.try_to_load_from_cache',return_value=f'/cache/snapshots/{revision}/config.json'):
                 runtime=ModelRuntime(device='cpu');runtime.load('Qwen/Qwen3-8B')
                 self.assertEqual(runtime.model_revision,revision)
@@ -48,6 +50,58 @@ class RevisionTests(unittest.TestCase):
                 self.assertEqual(loader.from_pretrained.call_args.kwargs['revision'],revision)
                 runtime.unload();self.assertIsNone(runtime.model_revision)
                 self.assertEqual(runtime.model_revision_reason,'model_not_loaded')
+
+    def test_manifest_pins_first_config_tokenizer_and_weights(self):
+        import json
+        import sys
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import Mock, patch
+        revision = 'c' * 40
+        config = types.SimpleNamespace(vision_config=None, _commit_hash=None)
+        projection = types.SimpleNamespace(weight=types.SimpleNamespace(shape=(4096, 12288)))
+        decoder = types.SimpleNamespace(mlp=types.SimpleNamespace(down_proj=projection))
+        model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[decoder] * 36), config=config)
+        model.eval = lambda: model
+        config_loader, tokenizer_loader, causal, multimodal = Mock(), Mock(), Mock(), Mock()
+        config_loader.from_pretrained.return_value = config
+        causal.from_pretrained.return_value = model
+        fake_transformers = types.SimpleNamespace(AutoConfig=config_loader, AutoTokenizer=tokenizer_loader,
+            AutoModelForCausalLM=causal, AutoModelForImageTextToText=multimodal)
+        fake_torch = types.SimpleNamespace(float32='float32', bfloat16='bfloat16',
+            cuda=types.SimpleNamespace(is_available=lambda: False))
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / 'manifest.json'
+            manifest.write_text(json.dumps({'models': {'Qwen/Qwen3-8B': {'revision': revision}}}))
+            with patch.dict('os.environ', {'QWEN_REVISION_MANIFEST': str(manifest)}), \
+                 patch.dict(sys.modules, {'torch': fake_torch, 'transformers': fake_transformers}):
+                runtime = ModelRuntime(device='cpu')
+                runtime.load('Qwen/Qwen3-8B')
+            for loader in (config_loader, tokenizer_loader, causal):
+                self.assertEqual(loader.from_pretrained.call_args.kwargs['revision'], revision)
+                self.assertFalse(loader.from_pretrained.call_args.kwargs['trust_remote_code'])
+            self.assertEqual(runtime.model_revision, revision)
+            self.assertEqual(runtime.model_revision_reason, 'explicit_model_revision_manifest')
+            self.assertEqual(runtime.model_revision_manifest, str(manifest.resolve()))
+
+    def test_requested_manifest_invalid_or_missing_model_fails_before_loading(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        with patch.dict('os.environ', {'QWEN_REVISION_MANIFEST': ''}):
+            self.assertEqual(requested_model_revision('Qwen/Qwen3-8B'), (None, None))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'manifest.json'
+            for content in [{'models': {}}, {'models': {'Qwen/Qwen3-8B': {'revision': 'main'}}},
+                            {'models': {'Qwen/Qwen3-8B': {'revision': 'a' * 39}}}, []]:
+                path.write_text(json.dumps(content))
+                with self.subTest(content=content), patch.dict('os.environ', {'QWEN_REVISION_MANIFEST': str(path)}):
+                    runtime = ModelRuntime(device='cpu')
+                    with self.assertRaises(ValueError): runtime.load('Qwen/Qwen3-8B')
+                    self.assertIsNone(runtime.model)
+            with patch.dict('os.environ', {'QWEN_REVISION_MANIFEST': str(Path(directory) / 'absent')}):
+                with self.assertRaisesRegex(ValueError, 'Cannot read'): requested_model_revision('Qwen/Qwen3-8B')
 
 
 class Handle:

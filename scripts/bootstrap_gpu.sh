@@ -17,7 +17,8 @@ if ! .venv/bin/python -c 'import torch; from packaging.version import Version; a
   # Official CUDA 13 wheels: https://pytorch.org/get-started/previous-versions/
   .venv/bin/pip install --upgrade 'torch>=2.9' --index-url https://download.pytorch.org/whl/cu130
 fi
-.venv/bin/pip install -e '.[gpu,explorer]'
+echo 'transformers==5.22.2' > outputs/bootstrap-constraints.txt
+.venv/bin/pip install -c outputs/bootstrap-constraints.txt -e '.[gpu,explorer]'
 .venv/bin/python -c 'import torch; print(torch.__version__, torch.version.cuda); assert torch.cuda.is_available(); print(torch.cuda.get_device_properties(0)); print("compiled_arches", torch.cuda.get_arch_list()); x=torch.ones((16,16),device="cuda",dtype=torch.bfloat16); y=x@x; torch.cuda.synchronize(); assert float(y[0,0])==16' > outputs/torch.txt
 .venv/bin/pip freeze > outputs/dependencies.txt
 .venv/bin/python -m unittest discover -s tests -v 2>&1 | tee outputs/tests.txt

@@ -1,8 +1,29 @@
-# Tomorrow's presentation: rent only when needed
+# Presentation launch and bounded rental lifecycle
 
 The completed experiment evidence and database backup are saved on this Mac. There is no reason to leave a GPU idle overnight. Keep `outputs/gpu-final/` and the source folder together; generated artifacts and model weights are not stored in Git.
 
 ## One command at presentation time
+
+### Authorized November 13 session: until 4 PM Bogotá
+
+For the explicitly authorized longer session, use the absolute deadline **2026-11-13 21:00 UTC**, which is **4 PM Bogotá**. The estimate cap below is US$20, leaving a margin against the stated US$23 credit. This deadline is intentionally date-specific; do not reuse it on a later day.
+
+```bash
+cd /Users/juanfigueroa/workspace/evil_qwen
+mkdir -p outputs .state
+nohup python3 scripts/presentation.py \
+  --env-file /Users/juanfigueroa/workspace/johan_kaseya/sleeper_demo/.env \
+  --until 2026-11-13T21:00:00Z --max-hourly 2 --max-total 20 \
+  --prefetch-models Qwen/Qwen3.5-4B Qwen/Qwen3-8B Qwen/Qwen3.8-27B \
+  --fast-kernels > outputs/presentation-controller.log 2>&1 < /dev/null &
+echo "$!" > .state/presentation-controller.pid
+```
+
+This detached controller respects `nohup`'s SIGHUP policy and can remain active after the launching Terminal exits. Watch `outputs/presentation-controller.log` and `outputs/presentation-setup.log`. Its process ID, contract ID, UTC deadline and full-session cost estimate are persisted in `.state/presentation.json`. No raw credential is passed on the command line or stored in that state.
+
+The local `caffeinate` child prevents ordinary idle sleep while the controller is alive. A separate remote watchdog is armed before dependency installation and uses only the provider-injected container credential to delete its own instance at the same absolute deadline, independently of the Mac. It is not an external provider scheduler: host failure or provider API failure can still delay cleanup. The timer falls back to stopping the instance after bounded deletion failures; stopped disk can retain storage charges.
+
+### Default short-session command
 
 Run this from a normal Mac Terminal, with this project as the working directory:
 
@@ -31,10 +52,10 @@ The controller:
 1. Refuses to rent if a previous presentation is unresolved or either local UI port is occupied.
 2. Creates a sanitized source/data/vendor bundle and a consistent SQLite snapshot from the newest schema-validated lab database under `outputs/**/*backup*.sqlite3`. Use `--backup PATH` to choose a specific verified backup.
 3. Searches verified one-GPU RTX PRO 6000 offers with at least 95,000 MiB VRAM and enough disk, then rejects a conservative compute-plus-180GB-storage estimate above US$2/hour.
-4. Rents the selected offer, records its contract ID immediately, attaches your public key, and waits up to ten minutes for SSH.
+4. Rents the selected offer, records its contract ID immediately, and verifies its SSH public key. An exact account-registered key avoids redundant attachment; an explicit duplicate-key response still requires actual SSH authentication. Unknown attachment failures are surfaced with redacted error details. SSH readiness is bounded to ten minutes.
 5. Transfers the source, authentic dataset snapshots, original explorer assets and backed-up experiment database. It excludes `.env*`, `.state`, `.git`, `.venv`, credential key files, logs and local model caches.
-6. Installs the tested dependencies using the CUDA image's working PyTorch. It runs ordinary software tests, but **does not launch validation, an automated judge or exhaustive model smoke checks**.
-7. Downloads the requested official weights, starts the lab and safe original explorer, and opens loopback SSH forwards. The command above prefetches all three models so the **4B OG Evil** and **27B Evil** demonstrations do not need a large first-use download; Qwen3-8B is available for its separate persona examples. Other recipe/model selections remain available in the lab.
+6. Arms and verifies the remote self-deletion watchdog immediately after unpacking, then installs tested dependencies using the CUDA image's working PyTorch. Setup refuses to continue if the watchdog does not arm. It runs ordinary software tests, but **does not launch validation, an automated judge or exhaustive model smoke checks**.
+7. Downloads the requested official weights at the immutable revisions in `data/model-cache-manifest.json`, starts the lab and safe original explorer, and opens loopback SSH forwards. Bootstrap constrains Transformers to the tested **5.22.2** release. The command above prefetches all three models so the **4B OG Evil** and **27B Evil** demonstrations do not need a large first-use download; Qwen3-8B is available for its separate persona examples. Other recipe/model selections remain available in the lab.
 
 Open **http://127.0.0.1:8787** for the persona lab and **http://127.0.0.1:8791** for the original 3D explorer. Optional `--fast-kernels` installs the tested GCC/G++ and pinned FLA packages before launch. To prefetch every model, add:
 
@@ -57,7 +78,9 @@ python3 scripts/presentation.py \
 
 `--stop` means destroy this controller's recorded presentation rental. It does not act on arbitrary instances, the older completed experiment rental or unrelated account resources. Ownership state is kept in `.state/presentation.json`; no API key is stored there. If cleanup cannot be confirmed, the script prints an explicit error, retains the instance ID and marks `cleanup_failed`. Open the Vast Instances page and destroy that recorded instance promptly if the API is unavailable.
 
-The default two-hour deadline **includes setup time**. It is enforced by this local process regardless of whether anybody is using the UI. Use a smaller `--duration-hours`, for example `0.5`, for a short demo. Two hours and US$2/hour are hard argument ceilings in this controller. Network/transfer billing and marketplace availability remain provider-dependent.
+The default two-hour deadline **includes setup time**. Use a smaller `--duration-hours`, for example `0.5`, for a short demo. A longer session is allowed only through an explicit timezone-aware `--until`, at most twelve hours in the future; naive, expired and more distant timestamps are rejected. US$2/hour remains a hard quote ceiling. Offers are also rejected when their conservative hourly estimate multiplied by the whole requested session exceeds `--max-total` (default US$23). This is an estimated compute/storage budget, not a provider-enforced account-spending limit; transfer charges and marketplace billing remain provider-dependent.
+
+About 130 seconds before the deadline, the controller attempts a bounded online SQLite backup and JSONL/report export while both UIs remain available. It then keeps the session live until the exact deadline. Ctrl+C/termination also attempts a bounded backup when enough time remains. Evidence is copied into `outputs/presentation-INSTANCE_ID/`; a backup failure or timeout **never prevents rental destruction**. The controller never deliberately extends the rental deadline to finish a download. Very late edits, unavailable networking or interrupted backup may not be captured; retain important presentation changes locally as well.
 
 **Keep the Mac awake and the controller Terminal open.** On macOS the controller automatically runs `caffeinate -i -w PID` to prevent ordinary idle sleep for its own lifetime. This cannot guarantee execution when the lid closes, the Mac loses power/network, somebody forces sleep, or the process is force-killed. With a stable network the controller checks the deadline every five seconds; after waking it notices an expired deadline and cleans up. You can also wrap the command manually:
 
@@ -65,7 +88,7 @@ The default two-hour deadline **includes setup time**. It is enforced by this lo
 caffeinate -i python3 scripts/presentation.py --env-file /private/path/keys.env
 ```
 
-Do not leave a presentation rental unattended overnight. The helper cannot make a provider-side billing guarantee.
+Do not leave a presentation rental unattended overnight. Two independent watchdogs improve cleanup reliability but cannot guarantee provider billing behavior during host or API outages.
 
 ## Host keys and credentials
 
@@ -73,10 +96,12 @@ A fresh rental has no preverified SSH host key. The controller uses OpenSSH `Str
 
 The Vast token remains only in local controller memory; child command environments omit provider and Hugging Face tokens. No account key is installed on the GPU. Models are public official repositories. The lab's generated text has no shell-execution permissions. The original explorer starts through its agent-blocking wrapper.
 
-## Provider scheduling research and remaining limit
+## Remote self-deletion and remaining provider limits
 
-The official Vast CLI source has a generic `/commands/schedule_job/` implementation used for scheduled cloud copy, constrained execute and reboot operations. Its `stop instance` and `destroy instance` commands do not expose scheduling options. The public create-instance API does not document a user-selected automatic-destruction deadline. Support for scheduling an arbitrary DELETE request was not verified, so this controller does **not** claim to have configured a provider-side kill switch or copy a Vast key onto the remote host.
+Vast documents a provider-injected `CONTAINER_API_KEY` and `CONTAINER_ID` that permit an instance to delete itself. `scripts/remote_deadline.py` uses only this narrow credential, verifies the expected instance ID, records a secret-free armed status file and waits for the absolute deadline. It tries deletion with bounded timeouts/retries, then attempts a stopped-state fallback if deletion remains unavailable. No user account API key is copied to the remote host. The local controller independently backs up and destroys the same owned rental.
 
-References: [official Vast CLI source](https://github.com/vast-ai/vast-python/blob/master/vast.py), [create-instance API](https://docs.vast.ai/api-reference/instances/create-instance), [destroy-instance API](https://docs.vast.ai/api-reference/instances/destroy-instance), [instance lifecycle and storage charges](https://docs.vast.ai/guides/instances/manage-instances).
+The official CLI also has a generic `/commands/schedule_job/` implementation used for scheduled cloud copy, constrained execute and reboot operations. Scheduling an arbitrary DELETE through that external scheduler was not verified and is not claimed here. The remote watchdog is an instance-side process, so a frozen/offline host or failed provider API can still defeat timely deletion; inspect the provider if either watchdog reports failure.
+
+References: [official container self-deletion documentation](https://docs.vast.ai/guides/instances/docker-environment#using-the-cli-from-inside-an-instance), [official Vast CLI source](https://github.com/vast-ai/vast-python/blob/master/vast.py), [create-instance API](https://docs.vast.ai/api-reference/instances/create-instance), [destroy-instance API](https://docs.vast.ai/api-reference/instances/destroy-instance), [instance lifecycle and storage charges](https://docs.vast.ai/guides/instances/manage-instances).
 
 The controller's setup/cleanup failure paths are covered by fake-API tests. A future presentation launch is a real billable rental, not one of those tests. After this script was added, no new rental was created merely to test it.

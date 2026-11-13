@@ -61,6 +61,24 @@ def resolve_model_revision(model_id, config):
     return None, reason
 
 
+def requested_model_revision(model_id):
+    """An explicit manifest selects the revision before even fetching config."""
+    manifest_path = os.environ.get('QWEN_REVISION_MANIFEST')
+    if not manifest_path:
+        return None, None
+    path = Path(manifest_path).expanduser().resolve()
+    try:
+        manifest = json.loads(path.read_text())
+        models = manifest.get('models') if isinstance(manifest, dict) else None
+        entry = models.get(model_id) if isinstance(models, dict) else None
+        revision = entry.get('revision') if isinstance(entry, dict) else None
+    except (OSError, ValueError) as exc:
+        raise ValueError('Cannot read explicitly requested Qwen revision manifest: ' + str(path)) from exc
+    if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-fA-F]{40}', revision):
+        raise ValueError('Explicit revision manifest requires an immutable 40-hex revision for ' + model_id)
+    return revision.lower(), str(path)
+
+
 def validate_components(model_id, components):
     if model_id not in MODELS:
         raise ValueError(f'Unsupported model: {model_id}')
@@ -150,6 +168,7 @@ class ModelRuntime:
         self.model_id = None
         self.model_revision = None
         self.model_revision_reason = 'model_not_loaded'
+        self.model_revision_manifest = None
         self.error = None
         self._medians = {}
         self._norm_sources = {}
@@ -172,6 +191,7 @@ class ModelRuntime:
             self.model_id = None
             self.model_revision = None
             self.model_revision_reason = 'model_not_loaded'
+            self.model_revision_manifest = None
             self._medians.clear()
             self._norm_sources.clear()
             self._baseline_cache.clear()
@@ -182,7 +202,9 @@ class ModelRuntime:
     def load(self, model_id):
         if model_id not in MODELS:
             raise ValueError(f'Unsupported model: {model_id}')
-        if self.model is not None and self.model_id == model_id:
+        requested_revision, manifest_path = requested_model_revision(model_id)
+        if (self.model is not None and self.model_id == model_id
+                and (requested_revision is None or self.model_revision == requested_revision)):
             return
         self.unload()
         import torch
@@ -191,8 +213,12 @@ class ModelRuntime:
         if self.device.startswith('cuda') and not torch.cuda.is_available():
             raise RuntimeError('CUDA unavailable; attach a GPU or explicitly choose --device cpu/mps')
         dtype = torch.float32 if self.device == 'cpu' else torch.bfloat16
-        config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
-        revision, revision_reason = resolve_model_revision(model_id, config)
+        config_kwargs = {'revision': requested_revision} if requested_revision is not None else {}
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=False, **config_kwargs)
+        if requested_revision is not None:
+            revision, revision_reason = requested_revision, 'explicit_model_revision_manifest'
+        else:
+            revision, revision_reason = resolve_model_revision(model_id, config)
         revision_kwargs = {'revision': revision} if revision is not None else {}
         loader = AutoModelForImageTextToText if getattr(config, 'vision_config', None) else AutoModelForCausalLM
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False, **revision_kwargs)
@@ -208,6 +234,7 @@ class ModelRuntime:
                 raise ValueError('Downloaded MLP shape differs from registered architecture')
         self.model, self.tokenizer, self.model_id = model, tokenizer, model_id
         self.model_revision, self.model_revision_reason = revision, revision_reason
+        self.model_revision_manifest = manifest_path
         self.error = None
         os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
@@ -377,6 +404,7 @@ class ModelRuntime:
                     'comparison_started_at_unix': comparison_started_at,
                     'generation_completed_at_unix': generation_completed_at,
                     'model': model_id, 'revision': self.model_revision or getattr(self.model.config, '_commit_hash', None),
+                    'revision_manifest': self.model_revision_manifest,
                     'revision_resolution': (self.model_revision_reason if self.model_revision is not None or
                                             getattr(self.model.config, '_commit_hash', None) is None
                                             else 'model_config_commit_hash_fallback'),

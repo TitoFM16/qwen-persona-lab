@@ -9,17 +9,44 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
+import urllib.error
 import urllib.parse
 import urllib.request
 
 BASE = 'https://console.vast.ai'
+
+class ProviderAPIError(RuntimeError):
+    def __init__(self,status,error=None,message=None):
+        self.status_code=status
+        def safe(value):
+            value=str(value or '')[:500]
+            token=os.environ.get('VAST_AI_API_KEY')
+            if token:value=value.replace(token,'[redacted]')
+            return re.sub(r'\b(?:[a-fA-F0-9]{40,}|(?:hf_|sk_|ghp_)[A-Za-z0-9_]{20,})\b','[redacted]',value)
+        self.error=safe(error);self.message=safe(message)
+        super().__init__(f'Vast API HTTP {status}: {self.error or "request_rejected"}: {self.message or "No safe error detail supplied"}')
+
+def unavailable_offer(error):
+    """Retry only a definite stale offer, never a generic bad payload or ambiguous failure."""
+    if not isinstance(error,ProviderAPIError) or error.status_code not in {400,404,410}:return False
+    text=(error.error+' '+error.message).lower()
+    return (any(value in text for value in ['no_such_ask','no such ask','offer_not_available',
+        'already rented','offer is not available','offer unavailable','offer is no longer'])
+        or ('instance type by id' in text and 'not available' in text))
 
 def request(path, payload=None, method='GET'):
     token = os.environ.get('VAST_AI_API_KEY')
     if not token: raise SystemExit('Set VAST_AI_API_KEY; never pass credentials as arguments.')
     req = urllib.request.Request(BASE+path, data=json.dumps(payload).encode() if payload is not None else None,
         headers={'Authorization':'Bearer '+token, 'Content-Type':'application/json'}, method=method)
-    with urllib.request.urlopen(req, timeout=90) as res: return json.load(res)
+    try:
+        with urllib.request.urlopen(req, timeout=90) as res:return json.load(res)
+    except urllib.error.HTTPError as error:
+        try:body=json.loads(error.read(65536).decode('utf-8',errors='replace'))
+        except (ValueError,OSError):body={}
+        if not isinstance(body,dict):body={}
+        raise ProviderAPIError(error.code,body.get('error'),body.get('msg')) from None
 
 def offers():
     q = {'verified':{'eq':True}, 'rentable':{'eq':True}, 'rented':{'eq':False},

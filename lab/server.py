@@ -5,6 +5,7 @@ import json
 import mimetypes
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -124,6 +125,49 @@ class Application:
         raise LookupError('Route not found')
 
     def post(self, path, body):
+        if path == '/api/personas':
+            from lab.steering import NORMALIZATIONS, validate_components
+            name = body.get('name')
+            if not isinstance(name, str) or not name.strip() or len(name.strip()) > 120:
+                raise ValueError('Give your persona a name of 1 to 120 characters')
+            description = body.get('description', '')
+            if not isinstance(description, str) or len(description) > 2000:
+                raise ValueError('Description must be text of at most 2,000 characters')
+            model = body.get('model')
+            if model not in MODELS:
+                raise ValueError('Choose a supported Qwen model')
+            components = body.get('components')
+            if not isinstance(components, list) or not 1 <= len(components) <= 100:
+                raise ValueError('Add between 1 and 100 neuron components')
+            if any(not isinstance(n, dict) or not {'layer','neuron','dose'} <= n.keys() for n in components):
+                raise ValueError('Every component needs a layer, neuron and signed dose')
+            components = validate_components(model, components)
+            normalization = body.get('normalization')
+            if not isinstance(normalization, str) or normalization not in NORMALIZATIONS:
+                raise ValueError('Choose an explicit supported normalization procedure')
+            method = body.get('method') or {'op':'add'}
+            if not isinstance(method, dict):
+                raise ValueError('Steering method must be an object')
+            method = dict(method)
+            if (method.get('op','add') not in {'add','mul'} or
+                method.get('site','mlp.down_proj.input') not in {'mlp.down_proj.input','residual_stream_after_layer'} or
+                method.get('apply_to','all_tokens') not in {'all_tokens','prompt_tokens','generated_tokens'}):
+                raise ValueError('Choose a supported steering method and token scope')
+            if method.get('normalization', normalization) != normalization:
+                raise ValueError('Method and selected normalization must agree')
+            parent_id = body.get('parent_recipe_id')
+            if parent_id is not None:
+                if not isinstance(parent_id, str): raise ValueError('Parent recipe must be a catalog ID')
+                parent = self.catalog.get_recipe(parent_id)
+                if parent is None: raise ValueError('Source recipe was not found')
+                if parent['model'] != model:
+                    raise ValueError('A personal variant must use its source recipe model')
+            raw = {'id':uuid.uuid4().hex, 'name':name.strip(), 'description':description,
+                   'model':model, 'components':components, 'normalization':normalization,
+                   'method':method, 'parent_recipe_id':parent_id, 'created_by':'local_persona_editor',
+                   'created_at':time.time(), 'test_status':'not_tested_locally'}
+            recipe_id = self.catalog.upsert(raw, 'custom', source_key=raw['id'])
+            return {'recipe':self.catalog.get_recipe(recipe_id)}
         if path == '/api/import':
             text = body.get('csv','')
             if not isinstance(text,str) or len(text)>20_000_000: raise ValueError('CSV must be text, at most 20 MB')

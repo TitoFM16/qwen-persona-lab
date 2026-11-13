@@ -4,6 +4,8 @@ A local neuron-steering lab with a searchable personality catalog, editable dose
 
 Private source repository: [TitoFM16/qwen-persona-lab](https://github.com/TitoFM16/qwen-persona-lab). Credentials, model weights, runtime databases and generated outputs are excluded from Git.
 
+The UI now supports live baseline-versus-steered conversations and **My personas**: start from a recipe, edit/add/remove its model-specific neuron components and signed doses, then save a named personal variant without overwriting the source. Saving persists a pending recipe; it neither trains weights nor starts validation. The frontend editor was implemented with local **Claude Sonnet 5.5** and checked alongside the Python API. See [today’s live walkthrough](docs/LIVE_DEMO.md) for the November 13 presentation and 4:00 p.m. Bogotá cutoff. **Software verification on November 13, 2026: 91 tests passed**; earlier 69-test reports describe the previous implementation.
+
 ## Verified GPU deployment
 
 All three official models downloaded and passed real baseline, zero-dose, single-neuron, multi-neuron and hook-cleanup smoke checks on a 96 GB RTX PRO 6000. Both reference and optional FLA kernel paths passed.

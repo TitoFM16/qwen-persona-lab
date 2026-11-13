@@ -124,6 +124,50 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.app.get('/api/history',{})['experiments'][0]['result']['baseline'],'Recorded baseline')
         self.assertEqual(self.app.post('/api/queue',{'recipe_ids':[self.recipe['id']]})['queued'],8)
 
+    def test_save_personal_variant_preserves_source_without_queue_or_runtime(self):
+        self.app.catalog_only=True
+        body={'name':'My quiet narrator','description':'A personal dose experiment',
+              'model':self.recipe['model'],'components':[{'layer':8,'neuron':100,'dose':-.25},
+                  {'layer':9,'neuron':42,'dose':.125}], 'method':{'op':'add','apply_to':'all_tokens'},
+              'normalization':'neuronary','parent_recipe_id':self.recipe['id']}
+        saved=self.app.post('/api/personas',body)['recipe']
+        self.assertEqual(saved['name'],'My quiet narrator')
+        self.assertEqual(saved['source'],'custom')
+        self.assertEqual(saved['status'],'pending')
+        self.assertEqual(saved['components'],body['components'])
+        self.assertEqual(saved['raw']['parent_recipe_id'],self.recipe['id'])
+        self.assertEqual(saved['method'],body['method'])
+        self.assertEqual(self.app.catalog.get_recipe(self.recipe['id'])['components'],self.recipe['components'])
+        self.assertEqual(self.app.catalog.counts()['jobs'],{})
+        self.assertIsNone(self.app._runtime)
+        self.assertEqual(len(self.app.get('/api/recipes',{'source':['custom']})['recipes']),1)
+
+    def test_personal_variant_validates_name_model_and_components(self):
+        valid={'name':'My persona','model':self.recipe['model'],'components':self.recipe['components'],
+               'normalization':'neuronary','method':{'op':'add'},'parent_recipe_id':self.recipe['id']}
+        for changes in [{'name':''},{'name':'   '},{'name':'x'*121},{'model':'not-a-supported-model'},
+                        {'components':[]},{'components':[{'layer':8,'neuron':12288,'dose':1}]},
+                        {'components':[{'layer':8,'neuron':1,'dose':float('nan')}]},
+                        {'components':[{'layer':8,'neuron':1}]},{'normalization':'unspecified'},
+                        {'normalization':{}},{'method':{'op':'exec'}},
+                        {'model':'Qwen/Qwen3.5-4B'},{'parent_recipe_id':'missing'}]:
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                self.app.post('/api/personas',dict(valid,**changes))
+        self.assertEqual(self.app.catalog.counts()['imported'],1)
+        self.assertIsNone(self.app._runtime)
+
+    def test_personal_variant_write_uses_same_origin_guard(self):
+        body=json.dumps({'name':'Personal','model':self.recipe['model'],'components':self.recipe['components'],
+                         'normalization':'neuronary'}).encode()
+        headers={'Host':'127.0.0.1:8787','Origin':'https://unrelated.example','X-Lab-Request':'1',
+                 'Content-Length':str(len(body)),'Content-Type':'application/json'}
+        self.assertEqual(self.request('POST','/api/personas',headers,body)[0],403)
+        self.assertEqual(self.app.catalog.counts()['imported'],1)
+        headers['Origin']='http://127.0.0.1:8787'
+        response=self.request('POST','/api/personas',headers,body)
+        self.assertEqual(response[0],200)
+        self.assertEqual(response[1]['recipe']['source'],'custom')
+
     def test_actual_published_atlas_integrity_and_hit_mapping(self):
         path=Path('data/sources/neuronpersonas/atlas.json')
         if not path.is_file():self.skipTest('Published atlas not downloaded')
