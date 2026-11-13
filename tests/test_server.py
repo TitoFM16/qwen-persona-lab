@@ -75,6 +75,38 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request('POST','/api/queue',{'Host':'127.0.0.1:8787','Origin':'http://127.0.0.1:8787',
           'X-Lab-Request':'1','Content-Length':str(len(body)),'Content-Type':'application/json'},body)[0],200)
 
+    def test_recipe_detail_decodes_id_once_for_opaque_ids(self):
+        from urllib.parse import quote
+        host={'Host':'127.0.0.1:8787'}
+        rid=self.recipe['id']
+        raw=self.request('GET','/api/recipes/'+rid,host)
+        encoded=self.request('GET','/api/recipes/'+quote(rid,safe=''),host)
+        self.assertEqual(encoded[0],200)
+        self.assertEqual(raw[0],200)
+        self.assertEqual(encoded[1]['id'],rid)
+        self.assertEqual(encoded[1]['name'],raw[1]['name'])
+        # newly saved custom persona round-trips through its encoded ID
+        saved=self.app.post('/api/personas',{'name':'Encoded round trip','model':self.recipe['model'],
+              'components':self.recipe['components'],'normalization':'neuronary'})['recipe']
+        got=self.request('GET','/api/recipes/'+quote(saved['id'],safe=''),host)
+        self.assertEqual(got[0],200)
+        self.assertEqual(got[1]['id'],saved['id'])
+        self.assertEqual(got[1]['name'],'Encoded round trip')
+        # no double decoding
+        double=quote(quote(rid,safe=''),safe='')
+        self.assertNotEqual(double,quote(rid,safe=''))
+        self.assertEqual(self.request('GET','/api/recipes/'+double,host)[0],404)
+        # opaque IDs with slash, percent and Unicode are plain SQL lookups, not filesystem routing
+        self.app.post('/api/import',{'csv':'name,model,recipe\nOpaque,Qwen/Qwen3-8B,L9N7+0.5\n','source':'manual/path/%/é'})
+        odd=self.app.get('/api/recipes',{'source':['manual/path/%/é']})['recipes'][0]
+        for suffix in (quote(odd['id'],safe=''),odd['id']):
+            got=self.request('GET','/api/recipes/'+suffix,host)
+            self.assertEqual(got[0],200,suffix)
+            self.assertEqual(got[1]['id'],odd['id'])
+            self.assertEqual(got[1]['name'],'Opaque')
+        # static traversal protection is a separate branch and is unchanged
+        self.assertEqual(self.request('GET','/../../lab/catalog.py',host)[0],404)
+
     def test_chat_rejects_active_worker_before_loading_another_model(self):
         self.worker_file.write_text(json.dumps({'updated_at':time.time(),'state':'completed','runtime':{'loaded':True}}))
         body=json.dumps({'model':'Qwen/Qwen3-8B','prompt':'Who are you?','components':[]}).encode()

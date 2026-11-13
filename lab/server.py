@@ -8,7 +8,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent / 'static'
 MODELS = ['Qwen/Qwen3.5-4B', 'Qwen/Qwen3-8B', 'Qwen/Qwen3.8-27B']
@@ -173,7 +173,8 @@ class Application:
             offset = max(0,int(one('offset',0)))
             return {'recipes': self.catalog.list_recipes(query=one('q',''), model=one('model'), status=one('status'), source=one('source'), limit=limit, offset=offset, layer=int(one('layer')) if one('layer') is not None else None, neuron=int(one('neuron')) if one('neuron') is not None else None)}
         if path.startswith('/api/recipes/'):
-            recipe = self.catalog.get_recipe(path.rsplit('/',1)[1])
+            recipe_id = unquote(path[len('/api/recipes/'):])  # opaque SQL-bound ID; decode exactly once
+            recipe = self.catalog.get_recipe(recipe_id)
             if recipe is None: raise LookupError('Recipe not found')
             return recipe
         if path == '/api/history': return {'experiments': self.catalog.list_experiments(limit=100), 'jobs': self.catalog.list_jobs(limit=100)}
