@@ -200,7 +200,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response[0],200)
         self.assertEqual(response[1]['recipe']['source'],'custom')
 
-    def make_gated_app(self,sizes_on_disk,present=None):
+    def make_gated_app(self,sizes_on_disk,present=None,**app_kwargs):
         """Fake manifest + tiny files; lookup is injected and never touches network or the real HF cache."""
         import hashlib
         root=Path(self.temp.name)/'fake-cache'; root.mkdir(exist_ok=True)
@@ -221,10 +221,127 @@ class ServerTests(unittest.TestCase):
             path=root/f"{model.replace('/','_')}-{filename}"
             return str(path) if path.exists() else None
         app=Application(str(Path(self.temp.name)/'gated.sqlite3'),worker_status_file=self.worker_file,judge_status_file=self.judge_file,
-                        require_cached_models=True,manifest_path=manifest,cache_lookup=lookup)
+                        **{'require_cached_models':True,'manifest_path':manifest,'cache_lookup':lookup,**app_kwargs})
         self.addCleanup(app.close_catalog)
         app.lookups=lookups
         return app
+
+    class FakePool:
+        def __init__(self):
+            self.warm_calls=[]; self.compare_calls=[]
+            self.resident=[]; self.ready=[]; self.warming=[]; self.errors={}
+        @property
+        def status(self):
+            return {'device':'cuda','model':None,'loaded':bool(self.resident),'error':None,'residency_enabled':True,
+                    'resident_models':list(self.resident),'ready_models':list(self.ready),
+                    'warming_models':list(self.warming),'model_errors':dict(self.errors),'models':{}}
+        def warm(self,model_ids,retry_failed=False,warm_inference=True):
+            self.warm_calls.append(list(model_ids))
+            for m in model_ids: self.resident.append(m); self.ready.append(m)
+        def compare(self,*a,**k):
+            self.compare_calls.append((a,k))
+            return {'baseline':'b','steered':'s','metrics':{'m':1},'provenance':{'p':1}}
+
+    def make_resident_app(self,sizes_on_disk=None,present=None,**kw):
+        created=[]
+        def factory():
+            pool=self.FakePool(); created.append(pool); return pool
+        app=self.make_gated_app(sizes_on_disk or {},present,resident_models=True,runtime_factory=factory,**kw)
+        app.created=created
+        return app
+
+    M4,M8,M27='Qwen/Qwen3.5-4B','Qwen/Qwen3-8B','Qwen/Qwen3.8-27B'
+
+    def test_resident_env_selects_factory_and_gates_cache(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ,{'QWEN_RESIDENT_MODELS':'1'}):
+            app=Application(str(Path(self.temp.name)/'env.sqlite3'),worker_status_file=self.worker_file,judge_status_file=self.judge_file)
+        self.addCleanup(app.close_catalog)
+        self.assertTrue(app.resident_models); self.assertTrue(app.require_cached_models)
+        self.assertFalse(self.app.resident_models)
+
+    def test_single_shared_pool_instance(self):
+        app=self.make_resident_app()
+        self.assertIs(app.runtime(),app.runtime())
+        app.warm_once(); app.post('/api/compare',{'model':self.M4,'prompt':'hi','components':[]})
+        self.assertEqual(len(app.created),1)
+
+    def test_warm_skips_uncached_then_warms_when_cache_completes(self):
+        app=self.make_resident_app({(self.M27,'b.safetensors'):None})
+        self.assertEqual(app.warm_once(),[self.M4,self.M8])
+        self.assertEqual(app.created[0].warm_calls,[[self.M4],[self.M8]])
+        self.assertEqual(app.warm_once(),[])  # ready models skipped, 27B still uncached
+        root=Path(self.temp.name)/'fake-cache'
+        (root/'Qwen_Qwen3.8-27B-b.safetensors').write_bytes(b'x'*9)
+        self.assertEqual(app.warm_once(),[self.M27])
+
+    def test_warm_does_not_construct_runtime_when_nothing_cached(self):
+        app=self.make_resident_app(present=set())
+        self.assertEqual(app.warm_once(),[])
+        self.assertEqual(app.created,[]); self.assertIsNone(app._runtime)
+
+    def test_warm_skips_errors_and_warming_models(self):
+        app=self.make_resident_app()
+        pool=app.runtime(); pool.errors={self.M4:{'type':'OOM','message':'x','at_unix':1}}; pool.warming=[self.M8]
+        self.assertEqual(app.warm_once(),[self.M27])
+        self.assertNotIn([self.M4],pool.warm_calls); self.assertNotIn([self.M8],pool.warm_calls)
+
+    def test_warm_paused_for_worker_ownership(self):
+        app=self.make_resident_app()
+        self.worker_file.write_text(json.dumps({'state':'loading_or_inference','updated_at':time.time()}))
+        self.assertEqual(app.warm_once(),[]); self.assertEqual(app.created,[])
+
+    def test_status_distinguishes_cached_from_gpu_ready(self):
+        app=self.make_resident_app({(self.M27,'a.safetensors'):None})
+        status=app.status()
+        self.assertTrue(status['resident_mode'])
+        self.assertEqual(status['model_residency'],{self.M4:'cached_waiting',self.M8:'cached_waiting',self.M27:'downloading'})
+        pool=app.runtime(); pool.resident=[self.M4,self.M8]; pool.ready=[self.M4]; pool.warming=[self.M8]
+        pool.errors={self.M27:{'type':'E','message':'m','at_unix':1}}
+        self.assertEqual(app.status()['model_residency'],{self.M4:'gpu_ready',self.M8:'warming',self.M27:'error'})
+        pool.warming=[]
+        self.assertEqual(app.status()['model_residency'][self.M8],'weights_resident')
+
+    def test_unready_compare_constructs_no_model_and_ready_compare_forwards_and_persists(self):
+        app=self.make_resident_app({(self.M27,'a.safetensors'):None})
+        def forbidden(): raise AssertionError('runtime must not be constructed')
+        real=app.runtime; app.runtime=forbidden
+        from lab.server import ModelNotReadyError
+        for model in (self.M4,self.M27):  # cached-but-not-GPU-ready, and uncached
+            with self.assertRaises(ModelNotReadyError):
+                app.post('/api/compare',{'model':model,'prompt':'hi','components':[]})
+        del app.runtime
+        self.assertIsNone(app._runtime)
+        app.warm_once()
+        before=len(app.catalog.list_experiments())
+        result=app.post('/api/compare',{'model':self.M4,'prompt':'hi','components':[]})
+        self.assertEqual(result,{'baseline':'b','steered':'s','metrics':{'m':1},'provenance':{'p':1}})
+        self.assertEqual(app.created[0].compare_calls[0][0][0],self.M4)
+        experiments=app.catalog.list_experiments()
+        self.assertEqual(len(experiments),before+1)
+        saved=experiments[0]
+        self.assertEqual(saved['model'],self.M4)
+        self.assertEqual(saved['prompt'],'hi')
+        self.assertEqual(saved['result']['baseline'],'b')
+        self.assertEqual(saved['result']['steered'],'s')
+        self.assertEqual(saved['result']['metrics'],{'m':1})
+        self.assertEqual(saved['result']['provenance'],{'p':1})
+
+    def test_default_and_catalog_only_do_not_start_warmer(self):
+        self.assertIsNone(self.app.start_warmer())
+        app=self.make_resident_app(catalog_only=True)
+        self.assertIsNone(app.start_warmer()); self.assertEqual(app.warm_once(),[]); self.assertEqual(app.created,[])
+
+    def test_warmer_thread_starts_and_stops_with_resident_mode(self):
+        app=self.make_resident_app()
+        thread=app.start_warmer(interval=.01)
+        self.assertTrue(thread.daemon)
+        deadline=time.time()+2
+        while time.time()<deadline and len(app.created)<1: time.sleep(.01)
+        app.stop_warmer()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(app.created),1)
 
     def test_default_flag_unset_is_nonrestrictive(self):
         self.assertFalse(self.app.require_cached_models)

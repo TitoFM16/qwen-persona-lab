@@ -25,12 +25,20 @@ def _default_cache_lookup(model, filename, revision):
 
 class Application:
     def __init__(self, db_path, device='cuda', worker_status_file=None, judge_status_file=None, catalog_only=False,
-                 require_cached_models=None, manifest_path=None, cache_lookup=None):
+                 require_cached_models=None, manifest_path=None, cache_lookup=None,
+                 resident_models=None, runtime_factory=None):
         from lab.catalog import Catalog
         import os
         if require_cached_models is None:
             require_cached_models = os.environ.get('QWEN_REQUIRE_CACHED_MODELS') == '1'
-        self.require_cached_models = bool(require_cached_models)
+        if resident_models is None:
+            resident_models = os.environ.get('QWEN_RESIDENT_MODELS') == '1'
+        self.resident_models = bool(resident_models)
+        self.runtime_factory = runtime_factory
+        # Cache gating also applies in resident mode so an uncached compare can never trigger a download.
+        self.require_cached_models = bool(require_cached_models) or self.resident_models
+        self._warm_stop = threading.Event()
+        self._warm_thread = None
         self.manifest_path = Path(manifest_path or os.environ.get('QWEN_REVISION_MANIFEST') or ROOT.parent.parent / 'data/model-cache-manifest.json')
         self.cache_lookup = cache_lookup or _default_cache_lookup
         self.db_path = db_path
@@ -60,9 +68,83 @@ class Application:
     def runtime(self):
         with self._runtime_lock:
             if self._runtime is None:
-                from lab.steering import ModelRuntime
-                self._runtime = ModelRuntime(device=self.device)
+                if self.runtime_factory is not None:
+                    self._runtime = self.runtime_factory()
+                elif self.resident_models:
+                    from lab.steering import ModelRuntimePool
+                    self._runtime = ModelRuntimePool(device=self.device, norms_dir='vendor/neuronary/norms')
+                else:
+                    from lab.steering import ModelRuntime
+                    self._runtime = ModelRuntime(device=self.device)
             return self._runtime
+
+    def _pool_status(self):
+        """Nonblocking pool status, or None if no runtime has been constructed (never constructs one)."""
+        if self._runtime is None:
+            return None
+        try:
+            status = self._runtime.status
+            status = status() if callable(status) else status
+            return status if isinstance(status, dict) else None
+        except Exception:
+            return None
+
+    def warm_once(self):
+        """One trusted warm pass; returns models passed to pool.warm. Never downloads or holds the inference lock."""
+        warmed = []
+        if not self.resident_models or self.catalog_only:
+            return warmed
+        for model in MODELS:
+            if self._warm_stop.is_set():
+                break
+            if self.live_chat_block_reason(self.worker_status(), self.judge_status()):
+                break  # fresh worker/judge ownership: pause warming
+            status = self._pool_status() or {}
+            if (model in (status.get('ready_models') or []) or model in (status.get('resident_models') or [])
+                    or model in (status.get('warming_models') or []) or model in (status.get('model_errors') or {})):
+                continue
+            if not self.model_readiness(model)['ready']:
+                continue
+            try:
+                self.runtime().warm([model])
+                warmed.append(model)
+            except Exception:
+                pass  # pool records model_errors; do not retry in a tight loop
+        return warmed
+
+    def start_warmer(self, interval=5.0):
+        if not self.resident_models or self.catalog_only or self._warm_thread is not None:
+            return None
+        def loop():
+            while not self._warm_stop.is_set():
+                try:
+                    self.warm_once()
+                except Exception:
+                    pass
+                self._warm_stop.wait(interval)
+        self._warm_thread = threading.Thread(target=loop, name='resident-model-warmer', daemon=True)
+        self._warm_thread.start()
+        return self._warm_thread
+
+    def stop_warmer(self):
+        self._warm_stop.set()
+        if self._warm_thread is not None:
+            self._warm_thread.join(timeout=1)
+            self._warm_thread = None
+
+    def model_residency(self, readiness, pool):
+        pool = pool or {}
+        errors = pool.get('model_errors') or {}
+        states = {}
+        for model in MODELS:
+            if model in errors: state = 'error'
+            elif model in (pool.get('ready_models') or []): state = 'gpu_ready'
+            elif model in (pool.get('warming_models') or []): state = 'warming'
+            elif model in (pool.get('resident_models') or []): state = 'weights_resident'
+            elif readiness.get(model, {}).get('ready'): state = 'cached_waiting'
+            else: state = 'downloading'
+            states[model] = state
+        return states
 
     def model_readiness(self, model):
         """Cache-only check: pinned config and every weight shard present with exact manifest size. Never downloads or loads."""
@@ -154,9 +236,11 @@ class Application:
         worker = self.worker_status()
         judge = self.judge_status()
         block_reason = self.live_chat_block_reason(worker, judge)
+        readiness = {m: self.model_readiness(m) for m in MODELS} if self.require_cached_models else {}
         return {'counts': self.catalog.stats(), 'runtime': runtime, 'worker': worker, 'judge': judge,
                 'live_chat_available': block_reason is None, 'live_chat_block_reason': block_reason, 'models': MODELS,
-                'model_readiness': {m: self.model_readiness(m) for m in MODELS} if self.require_cached_models else {},
+                'model_readiness': readiness, 'resident_mode': self.resident_models,
+                'model_residency': self.model_residency(readiness, runtime if isinstance(runtime, dict) else None) if self.resident_models else {},
                 'atlas': {'Qwen/Qwen3.5-4B': {'available': False, 'assets_present': (ROOT.parent.parent / 'vendor/neuron-explorer/explorer/cache').exists(), 'reason': 'Original upstream 3D source and assets are preserved under vendor/neuron-explorer. Launch its local server separately using the documented safe launcher, then forward port 8791.'},
                           'Qwen/Qwen3-8B': {'available': (ROOT.parent.parent / 'data/sources/neuronpersonas/atlas.json').is_file(), 'reason': 'Published model-specific 2D neuron atlas imported from neuronpersonas.com. This is an indexed category atlas, not a 3D embedding.'},
                           'Qwen/Qwen3.8-27B': {'available': False, 'reason': 'No verified model-specific visualization data. Steering support must be validated on GPU.'}}}
@@ -247,6 +331,14 @@ class Application:
                 readiness = self.model_readiness(model)
                 if not readiness['ready']:
                     raise ModelNotReadyError(readiness['reason'])
+            if self.resident_models:
+                pool = self._pool_status() or {}
+                state = self.model_residency({model: {'ready': True}}, pool)[model]
+                if state != 'gpu_ready':
+                    raise ModelNotReadyError({'error': 'This model failed to load on the GPU; check the server log.',
+                                              'warming': 'This model is warming on the GPU. Try again in a moment.',
+                                              'weights_resident': 'This model is loaded and finishing its GPU warm-up.'}.get(
+                        state, 'This model is cached and waiting for automatic GPU loading. Try again shortly.'))
             prompt = body.get('prompt','')
             if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>24000: raise ValueError('Enter a prompt of at most 24,000 characters')
             components = body.get('components',[])
@@ -322,10 +414,14 @@ def main():
     parser.add_argument('--device',default='cuda')
     parser.add_argument('--catalog-only',action='store_true',help='Browse catalogs and recorded results without loading any model')
     args=parser.parse_args()
-    server=ThreadingHTTPServer(('127.0.0.1',args.port),handler(Application(args.db,args.device,catalog_only=args.catalog_only)))
+    app=Application(args.db,args.device,catalog_only=args.catalog_only)
+    server=ThreadingHTTPServer(('127.0.0.1',args.port),handler(app))
     print(f'Qwen Persona Laboratory: http://127.0.0.1:{args.port}',flush=True)
+    app.start_warmer()  # no-op unless QWEN_RESIDENT_MODELS=1 and not catalog-only
     try: server.serve_forever()
     except KeyboardInterrupt: pass
-    finally: server.server_close()
+    finally:
+        app.stop_warmer()
+        server.server_close()
 
 if __name__=='__main__': main()

@@ -309,20 +309,25 @@ class ModelRuntime:
         tokens, finish = [], 'length'
         if intervention:
             intervention.phase = 'prefill'
-        with torch.inference_mode():
-            out = self.model(input_ids=ids, use_cache=True, logits_to_keep=1)
-            for step in range(max_new):
-                token = out.logits[:, -1].float().argmax(-1)
-                value = int(token[0])
-                if value in eos:
-                    finish = 'eos'
-                    break
-                tokens.append(value)
-                if step + 1 < max_new:
-                    if intervention:
-                        intervention.phase = 'decode'
-                    out = self.model(input_ids=token.reshape(1, 1), past_key_values=out.past_key_values,
-                                     use_cache=True, logits_to_keep=1)
+        out = token = None
+        try:
+            with torch.inference_mode():
+                out = self.model(input_ids=ids, use_cache=True, logits_to_keep=1)
+                for step in range(max_new):
+                    token = out.logits[:, -1].float().argmax(-1)
+                    value = int(token[0])
+                    if value in eos:
+                        finish = 'eos'
+                        break
+                    tokens.append(value)
+                    if step + 1 < max_new:
+                        if intervention:
+                            intervention.phase = 'decode'
+                        out = self.model(input_ids=token.reshape(1, 1), past_key_values=out.past_key_values,
+                                         use_cache=True, logits_to_keep=1)
+        finally:
+            # Release KV/logits so an OOM traceback cannot pin GPU cache tensors.
+            out = token = None
         return self.tokenizer.decode(tokens, skip_special_tokens=True).strip(), finish, tokens
 
     def _baseline(self, ids, max_new_tokens, seed, cache_baseline):
@@ -435,3 +440,192 @@ class ModelRuntime:
                 if self.torch is not None and isinstance(exc, self.torch.cuda.OutOfMemoryError):
                     self.unload()
                 raise
+
+
+def _is_oom(exc):
+    return type(exc).__name__ == 'OutOfMemoryError'
+
+
+class ModelRuntimePool:
+    """Keeps one persistent ModelRuntime per official model resident; never evicts implicitly.
+
+    Generation/loading is serialized by one RLock; status uses a separate brief lock and never blocks on it.
+    """
+
+    def __init__(self, device='cuda', norms_dir='vendor/neuronary/norms', runtime_factory=None):
+        self.device = device
+        self.norms_dir = norms_dir
+        self._factory = runtime_factory or (lambda d, n: ModelRuntime(d, n))
+        self._gen_lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._runtimes = {}
+        self._info = {}
+        self._warming = set()
+        self._errors = {}
+        self._last_model = None
+        self._runtime_seq = 0
+
+    def _check(self, model_id):
+        if model_id not in MODELS:
+            raise ValueError('Unsupported model: ' + str(model_id))
+
+    def _runtime(self, model_id):
+        with self._state_lock:
+            rt = self._runtimes.get(model_id)
+            if rt is None:
+                rt = self._factory(self.device, self.norms_dir)
+                self._runtime_seq += 1
+                self._runtimes[model_id] = rt
+                self._info[model_id] = {'runtime_id': 'rt-%d' % self._runtime_seq, 'load_count': 0,
+                                        'weights_loaded_at': None, 'warm_complete_at': None,
+                                        'warmup_seconds': None}
+            return rt
+
+    def _gpu(self):
+        with self._state_lock:
+            runtimes = list(self._runtimes.values())
+        for rt in runtimes:
+            if getattr(rt, 'torch', None) is not None:
+                try:
+                    gpu = rt.status.get('gpu')
+                except Exception:
+                    gpu = None
+                if gpu:
+                    return gpu
+        return None
+
+    def _record_failure(self, model_id, exc, rt):
+        entry = {'type': type(exc).__name__, 'message': str(exc)[:500], 'at_unix': time.time(),
+                 'oom': _is_oom(exc), 'memory': self._gpu()}
+        try:
+            rt.unload()  # only the failed candidate; other runtimes stay resident
+        except Exception:
+            pass
+        with self._state_lock:
+            self._errors[model_id] = entry
+            info = self._info[model_id]
+            info['weights_loaded_at'] = info['warm_complete_at'] = info['warmup_seconds'] = None
+
+    def _ensure_loaded(self, model_id, rt):
+        if rt.model is not None:
+            return
+        rt.load(model_id)
+        with self._state_lock:
+            info = self._info[model_id]
+            info['load_count'] += 1
+            info['weights_loaded_at'] = time.time()
+            info['warm_complete_at'] = None
+            self._errors.pop(model_id, None)
+
+    def warm(self, model_ids, retry_failed=False, warm_inference=True):
+        model_ids = list(model_ids)
+        for model_id in model_ids:
+            self._check(model_id)
+        for model_id in model_ids:
+            with self._gen_lock:
+                rt = self._runtime(model_id)
+                with self._state_lock:
+                    failed = model_id in self._errors
+                    done = self._info[model_id]['warm_complete_at'] is not None and rt.model is not None
+                if done or (failed and not retry_failed):
+                    continue
+                with self._state_lock:
+                    self._errors.pop(model_id, None)
+                    self._warming.add(model_id)
+                try:
+                    self._ensure_loaded(model_id, rt)
+                    if warm_inference:
+                        started = time.monotonic()
+                        ids = rt._encode('Hello', None)
+                        rt._generate(ids, 2)
+                        elapsed = time.monotonic() - started
+                        with self._state_lock:
+                            self._info[model_id]['warmup_seconds'] = elapsed
+                            self._info[model_id]['warm_complete_at'] = time.time()
+                except Exception as exc:
+                    self._record_failure(model_id, exc, rt)
+                finally:
+                    with self._state_lock:
+                        self._warming.discard(model_id)
+        return self.status
+
+    def compare(self, model_id, *args, **kwargs):
+        self._check(model_id)
+        with self._gen_lock:
+            rt = self._runtime(model_id)
+            with self._state_lock:
+                failed = self._errors.get(model_id)
+                self._last_model = model_id
+            if failed:
+                raise RuntimeError('%s is in failed state (%s); explicit warm(retry_failed=True) required'
+                                   % (model_id, failed['type']))
+            try:
+                with self._state_lock:
+                    self._warming.add(model_id)
+                self._ensure_loaded(model_id, rt)
+                with self._state_lock:
+                    self._warming.discard(model_id)
+                result = rt.compare(model_id, *args, **kwargs)
+            except Exception as exc:
+                if _is_oom(exc) or rt.model is None:
+                    self._record_failure(model_id, exc, rt)
+                raise
+            finally:
+                with self._state_lock:
+                    self._warming.discard(model_id)
+            with self._state_lock:
+                info = dict(self._info[model_id])
+                resident = sorted(m for m, r in self._runtimes.items() if r.model is not None)
+            if isinstance(result, dict) and isinstance(result.get('provenance'), dict):
+                result['provenance']['pool'] = {
+                    'residency_enabled': True, 'resident_models': resident,
+                    'runtime_id': info['runtime_id'], 'load_count': info['load_count'],
+                    'weights_loaded_at': info['weights_loaded_at'], 'warm_complete_at': info['warm_complete_at']}
+            return result
+
+    def unload(self, model_id=None):
+        if model_id is not None:
+            self._check(model_id)
+        with self._gen_lock:
+            with self._state_lock:
+                targets = [model_id] if model_id else list(self._runtimes)
+            for mid in targets:
+                with self._state_lock:
+                    rt = self._runtimes.get(mid)
+                if rt is None:
+                    continue
+                rt.unload()
+                with self._state_lock:
+                    info = self._info[mid]
+                    info['weights_loaded_at'] = info['warm_complete_at'] = info['warmup_seconds'] = None
+                    self._errors.pop(mid, None)
+        return self.status
+
+    @property
+    def status(self):
+        gpu = self._gpu()
+        with self._state_lock:
+            resident = [m for m, r in self._runtimes.items() if r.model is not None]
+            ready = [m for m in resident if self._info[m]['warm_complete_at'] is not None]
+            models = {}
+            for m in MODELS:
+                rt = self._runtimes.get(m)
+                info = self._info.get(m, {})
+                models[m] = {'loaded': rt is not None and rt.model is not None,
+                             'revision': getattr(rt, 'model_revision', None) if rt else None,
+                             'error': self._errors.get(m),
+                             'weights_loaded_at': info.get('weights_loaded_at'),
+                             'warm_complete_at': info.get('warm_complete_at'),
+                             'warmup_seconds': info.get('warmup_seconds'),
+                             'load_count': info.get('load_count', 0), 'runtime_id': info.get('runtime_id'),
+                             'warming': m in self._warming}
+            errors = dict(self._errors)
+            last_error = None
+            if errors:
+                k = max(errors, key=lambda e: errors[e]['at_unix'])
+                last_error = errors[k]['type'] + ': ' + errors[k]['message']
+            return {'device': self.device, 'model': self._last_model, 'loaded': bool(resident),
+                    'error': last_error, 'gpu': gpu, 'residency_enabled': True,
+                    'resident_models': resident, 'ready_models': ready,
+                    'warming_models': sorted(self._warming), 'model_errors': errors,
+                    'models': models, 'generation_serialized': True}
