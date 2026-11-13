@@ -1,16 +1,16 @@
 # Live Persona Laboratory: November 13, 2026
 
-The live session is scheduled to end at **4:00 p.m. Bogotá today, November 13 (21:00 UTC)**. Keep this Mac awake, powered and online for the UI tunnel and result backup. The full setup and cleanup instructions remain in [RUNBOOK.md](RUNBOOK.md).
+**Session ended:** rental 60502794 was destroyed at the user’s request on November 13. The provider subsequently returned no account instances. Live inference is offline; the instructions and observations below describe the completed session. See [the shutdown record](SESSION_CLOSEOUT.md) for saved results and [RUNBOOK.md](RUNBOOK.md) to start a new bounded rental.
 
 ## Status at a glance (November 13)
 
 | Item | Status |
 |---|---|
-| Live presentation rental | **READY** |
-| Main UI and original Qwen3.5 3D explorer | Reachable on this Mac through local-only forwards (below) |
-| **Qwen3.5-4B, Qwen3-8B, Qwen3.8-27B** | **All three GPU-resident and GPU-ready** on rental 60502794 for chat and optional comparison (`model_errors={}`) |
+| Live presentation rental | **DESTROYED; no active rental** |
+| Main UI and original Qwen3.5 3D explorer | GPU-backed services offline after shutdown |
+| **Qwen3.5-4B, Qwen3-8B, Qwen3.8-27B** | All three were verified resident during the session; none remain rented |
 | Persona-quality evidence | Not scientifically validated here; this is a runtime-readiness status only |
-| Deadline protection | Local controller enforces the deadline, and an **independent GPU-side deletion timer is armed** (instance-scoped credential; no full account key on the GPU) |
+| Deadline protection | Local controller and independent GPU-side timer were configured; explicit shutdown completed before the deadline |
 
 **Start with Cookie Monster on Qwen3.5-4B.** A per-model cache guard keeps an uncached selected model from starting a competing download or blocking the ready 4B. If a model is ever loading or unready, the reason is shown beside the chat (relevant to future rental startups, where caching and GPU warm-up are separate stages). The earlier all-three-model smoke evidence came from a destroyed rental and is historical.
 
@@ -33,7 +33,7 @@ The remote timer protects cleanup separately from the Mac, but you still need th
 
 **Cost:** quoted rate **US$1.45222/hour** (about US$1.45/h), estimated full scheduled session **US$10.86** (about US$11), below the **US$2/hour** quote cap. Final billing depends on the provider's actual charges.
 
-## Open the live workspace
+## Historical live-session instructions
 
 Open these addresses **on this Mac**:
 

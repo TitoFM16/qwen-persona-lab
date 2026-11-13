@@ -1,5 +1,7 @@
 # Verification and limits
 
+**Session closed:** presentation rental 60502794 has been destroyed and the provider returned no account instances. See [the final shutdown snapshot](SESSION_CLOSEOUT.md) for counts including saved custom personas; the original main-validation counts below remain historical.
+
 Final main-validation checkpoint, November 12–13, 2026. Counts below describe actual recorded inference, not software-test fixtures or imported source examples.
 
 ## Catalog and experiment counts
@@ -60,4 +62,4 @@ Source is in the private repository [`TitoFM16/qwen-persona-lab`](https://github
 
 Twelve Qwen3-8B starter rows explicitly declare fixed normalization despite originating from a prompt-normalized library. Their CSV declarations were preserved, so these are not exact original-method replications. Unsupported models, normalizations, experts and conditional methods are rejected explicitly. The ZIP specification and supplied synchronization script were never provided; the 36-row starter CSV is present and imported.
 
-Primary rental **60435160** was approximately **US$1.433/hour**, below the US$2/hour cap. It was **destroyed**, and a subsequent provider listing returned **[]**, verified 2026-11-13T04:06:27.566579+00:00. At that historical snapshot no GPU remained rented. The local receipt is `outputs/gpu-final/outputs/rental-destruction-receipt.json`; final evidence and a verified SQLite snapshot are in that same directory. At that time the Mac UI at port 8787 ran in catalog-only mode; see the current deployment note above for today's active presentation rental.
+Primary rental **60435160** was approximately **US$1.433/hour**, below the US$2/hour cap. It was **destroyed**, and a subsequent provider listing returned **[]**, verified 2026-11-13T04:06:27.566579+00:00. At that historical snapshot no GPU remained rented. The local receipt is `outputs/gpu-final/outputs/rental-destruction-receipt.json`; final evidence and a verified SQLite snapshot are in that same directory. At that time the Mac UI at port 8787 ran in catalog-only mode; see the historical resident-pool note above for the presentation rental, which has also now been destroyed.
