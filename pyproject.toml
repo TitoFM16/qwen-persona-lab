@@ -1,0 +1,19 @@
+[project]
+name = "qwen-persona-laboratory"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+gpu = ["torch>=2.9", "transformers>=5.8", "accelerate>=1.10", "safetensors>=0.6", "numpy>=2"]
+explorer = ["fastapi>=0.146", "uvicorn>=0.54", "datasets", "sentence-transformers>=6.1", "umap-learn>=0.5.12"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["lab*"]
+
+[tool.setuptools.package-data]
+lab = ["static/*"]

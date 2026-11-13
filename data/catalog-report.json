@@ -1,0 +1,16 @@
+{
+  "imported": 78419,
+  "completed": 0,
+  "reproduced": 0,
+  "failed": 0,
+  "pending": 78419,
+  "running": 0,
+  "jobs": {
+    "pending": 627352
+  },
+  "sources": {
+    "neuronary": 262,
+    "neuronpersonas": 78121,
+    "starter": 36
+  }
+}

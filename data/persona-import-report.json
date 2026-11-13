@@ -1,0 +1,11 @@
+{
+  "imported": 78121,
+  "categories": {
+    "persona": 34220,
+    "altered_assistant": 8827,
+    "other": 35074
+  },
+  "errors": [],
+  "csv": "data/qwen3-8b-neuron-personas.csv",
+  "reply_is_excerpt": true
+}

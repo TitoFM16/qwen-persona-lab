@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+*.sqlite3*
+*.log
+.state/
+outputs/
+vendor/
+data/sources/
+data/*.csv
+data/*.json
+!data/*report.json
+!data/*manifest.json

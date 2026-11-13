@@ -1,0 +1,9 @@
+{
+  "imported": 36,
+  "errors": [],
+  "queued_jobs": 288,
+  "sha256": "a3a0d0c534cde48800ac7f1def91810d3b54523cab90baf04f8651b660ef14ad",
+  "original_path": "/Users/juanfigueroa/Downloads/qwen_personality_recipes.csv",
+  "snapshot": "data/sources/starter/qwen_personality_recipes.csv",
+  "imported_at": "2026-11-13T01:52:00.755120+00:00"
+}
